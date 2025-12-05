@@ -45,11 +45,16 @@ Look at your browser URL when logged into Cribl Cloud:
 
 ```
 https://main-amazing-varahamihira.cribl.cloud
-       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+       └────────────────────────────┘
        This is your Organization ID
 ```
 
-**Important:** Include the workspace prefix! It's usually `main-` followed by your organization name.
+⚠️ **Important:** Include the workspace prefix! It's usually `main-` followed by your organization name.
+
+Accepted formats:
+- `main-your-org-name`
+- `main-your-org-name.cribl.cloud`
+- `https://main-your-org-name.cribl.cloud/`
 
 ## Step 3: Configure Credentials
 

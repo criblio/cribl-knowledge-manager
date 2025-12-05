@@ -68,13 +68,15 @@ client_secret = your_client_secret_here
 organization_id = main-your-org-name
 ```
 
-### Option 2: Environment Variables
+### Option 2: Environment Variables (More Secure)
 
 ```bash
 export CRIBL_CLIENT_ID="your_client_id"
 export CRIBL_CLIENT_SECRET="your_client_secret"
 export CRIBL_ORG_ID="main-your-org-name"
 ```
+
+> **Security Note:** Environment variables are preferred as they don't persist secrets to disk. If using `config.ini`, ensure it's never committed to version control.
 
 ### Getting API Credentials
 
@@ -90,11 +92,16 @@ Your Organization ID is in the browser URL when logged into Cribl Cloud:
 
 ```
 https://main-your-org-name.cribl.cloud
-       ^^^^^^^^^^^^^^^^^^^^
-       This is your organization ID
+       └──────────────────┘
+       This is your Organization ID
 ```
 
-**Important:** Include the workspace prefix (usually `main-`)!
+⚠️ **Important:** Include the workspace prefix (usually `main-`)!
+
+Accepted formats:
+- `main-your-org-name`
+- `main-your-org-name.cribl.cloud`
+- `https://main-your-org-name.cribl.cloud/`
 
 ## Architecture
 
