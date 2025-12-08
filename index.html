@@ -389,6 +389,8 @@
             const [knowledgeActivityLog, setKnowledgeActivityLog] = useState({ type: null, message: '', details: [], timestamp: null }); // Activity log for Knowledge panel
             const [pendingDeployments, setPendingDeployments] = useState([]); // Array of pending deployments: {filename, targetGroup, targetApiType, commitId}
             const [showAllPending, setShowAllPending] = useState(false); // For expandable pending deployments UI
+            const [pendingLookupDeleteDeploy, setPendingLookupDeleteDeploy] = useState(null); // Track pending deploy after lookup delete: {workerGroup, apiType, filename}
+            const [deployingPendingLookup, setDeployingPendingLookup] = useState(false); // Track if lookup delete deploy is in progress
             const [targetVersion, setTargetVersion] = useState(null);
             const [showApiTokenHelp, setShowApiTokenHelp] = useState(false);
             const [showReadme, setShowReadme] = useState(false);
@@ -2984,43 +2986,19 @@
                             if (data.partial_commit) {
                                 addConsoleLog(`[OK] Partial commit successful - only deletion was committed`, 'success');
                             }
-                            showMessage(`Deleted ${selectedLookup}`, 'success');
-                            
-                            // Auto-deploy for Stream/Edge (not Search - it doesn't need deployment)
+                            showMessage(`Deleted ${selectedLookup} - deploy required`, 'success');
+
+                            // For Stream/Edge, require user to click Deploy (not Search - it doesn't need deployment)
                             if (sourceApiType !== 'search' && data.committed) {
-                                addConsoleLog(`[INFO] Deletion committed - auto-deploying to ${sourceGroup}...`, 'info');
-                                
-                                // Add delay to ensure backend commit has fully processed (same as transfer)
-                                await new Promise(resolve => setTimeout(resolve, 500));
-                                
-                                try {
-                                    const deployRes = await fetch(`${API_BASE}/api/deploy`, {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                            worker_group: sourceGroup,
-                                            api_type: sourceApiType
-                                        })
-                                    });
-                                    const deployData = await deployRes.json();
-                                    
-                                    if (deployData.success) {
-                                        addConsoleLog(`[OK] Deletion deployed to workers (partial deploy - only this change)`, 'success');
-                                        showMessage('Deleted and deployed', 'success');
-                                        updateActivityLog('success', `Deleted and deployed: ${selectedLookup}`,
-                                            [`Source: ${sourceGroup}`]);
-                                    } else {
-                                        addConsoleLog(`[WARNING] Auto-deploy failed: ${deployData.error}`, 'warning');
-                                        showMessage(`Deleted but deploy failed: ${deployData.error}`, 'warning');
-                                        updateActivityLog('warning', `Deleted but deploy failed: ${selectedLookup}`,
-                                            [`Error: ${deployData.error}`]);
-                                    }
-                                } catch (deployError) {
-                                    addConsoleLog(`[WARNING] Auto-deploy error: ${deployError.message}`, 'warning');
-                                    showMessage('Deleted but deploy failed', 'warning');
-                                    updateActivityLog('warning', `Deleted but deploy failed: ${selectedLookup}`,
-                                        [`Error: ${deployError.message}`]);
-                                }
+                                // Set pending deploy state to lock UI until user deploys
+                                setPendingLookupDeleteDeploy({
+                                    workerGroup: sourceGroup,
+                                    apiType: sourceApiType,
+                                    filename: selectedLookup
+                                });
+                                addConsoleLog(`[WARN] Deploy required to complete deletion!`, 'warning');
+                                updateActivityLog('warning', `Deleted: ${selectedLookup} - deploy required`,
+                                    [`Source: ${sourceGroup}`]);
                             } else {
                                 // Search doesn't need deployment
                                 updateActivityLog('success', `Deleted: ${selectedLookup}`,
@@ -3028,6 +3006,12 @@
                             }
                         }
 
+                        // Clear the deleted lookup from selectedLookups Set
+                        setSelectedLookups(prev => {
+                            const newSet = new Set(prev);
+                            newSet.delete(selectedLookup);
+                            return newSet;
+                        });
                         setSelectedLookup('');
                         setSavedLookupName('');
                         setSavedLookupContent('');
@@ -3995,7 +3979,7 @@
 
                                         {/* Delete Button - always visible but disabled when nothing selected */}
                                         <div className="mt-auto pt-2">
-                                            <button onClick={handleDeleteLookup} disabled={!selectedLookup} className={`w-full px-3 py-1.5 text-xs rounded-lg font-semibold transition-all ${!selectedLookup ? 'bg-gray-400 opacity-50 cursor-not-allowed text-white' : darkMode ? 'bg-red-900 hover:bg-red-800 text-red-200' : 'bg-red-500 hover:bg-red-600 text-white'}`}>
+                                            <button onClick={handleDeleteLookup} disabled={!selectedLookup || pendingLookupDeleteDeploy} className={`w-full px-3 py-1.5 text-xs rounded-lg font-semibold transition-all ${!selectedLookup || pendingLookupDeleteDeploy ? 'bg-gray-400 opacity-50 cursor-not-allowed text-white' : darkMode ? 'bg-red-900 hover:bg-red-800 text-red-200' : 'bg-red-500 hover:bg-red-600 text-white'}`} title={pendingLookupDeleteDeploy ? 'Deploy pending deletion first' : ''}>
                                                 <i className="fas fa-trash mr-1"></i>Delete
                                             </button>
                                         </div>
@@ -4306,7 +4290,7 @@
                                         <div className="mt-auto pt-2">
                                             <div className="flex items-center space-x-2">
                                                 {/* Transfer Button */}
-                                                <button onClick={handleBulkTransfer} disabled={transferring || selectedLookups.size === 0 || (sourceApiType !== 'search' && !selectedSourceGroup) || (targetApiType !== 'search' && selectedTargetGroups.size === 0)} className={`flex-1 px-3 py-1.5 text-xs rounded-lg font-semibold transition-all flex items-center justify-center space-x-1.5 ${transferring || selectedLookups.size === 0 || (sourceApiType !== 'search' && !selectedSourceGroup) || (targetApiType !== 'search' && selectedTargetGroups.size === 0) ? 'bg-gray-400 opacity-50 cursor-not-allowed text-white' : darkMode ? 'bg-green-600 hover:bg-green-700 text-white shadow-lg' : 'bg-green-500 hover:bg-green-600 text-white shadow-lg'}`}>
+                                                <button onClick={handleBulkTransfer} disabled={transferring || selectedLookups.size === 0 || (sourceApiType !== 'search' && !selectedSourceGroup) || (targetApiType !== 'search' && selectedTargetGroups.size === 0) || pendingLookupDeleteDeploy} className={`flex-1 px-3 py-1.5 text-xs rounded-lg font-semibold transition-all flex items-center justify-center space-x-1.5 ${transferring || selectedLookups.size === 0 || (sourceApiType !== 'search' && !selectedSourceGroup) || (targetApiType !== 'search' && selectedTargetGroups.size === 0) || pendingLookupDeleteDeploy ? 'bg-gray-400 opacity-50 cursor-not-allowed text-white' : darkMode ? 'bg-green-600 hover:bg-green-700 text-white shadow-lg' : 'bg-green-500 hover:bg-green-600 text-white shadow-lg'}`} title={pendingLookupDeleteDeploy ? 'Deploy pending deletion first' : ''}>
                                                     {transferring ? (<><div className="spinner w-4 h-4"></div><span>{bulkTransferProgress.current}/{bulkTransferProgress.total}</span></>) : (<><i className="fas fa-exchange-alt"></i><span>Transfer</span></>)}
                                                 </button>
 
@@ -6320,6 +6304,94 @@
                                     {deployingPendingKnowledge ? (
                                         <>
                                             <div className="spinner w-4 h-4"></div>
+                                            <span>Deploying...</span>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <i className="fas fa-rocket"></i>
+                                            <span>Deploy Now</span>
+                                        </>
+                                    )}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Blocking Deploy Required Modal for Lookup Deletion */}
+                    {pendingLookupDeleteDeploy && (
+                        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-[100] p-4">
+                            <div
+                                className={`${darkMode ? 'bg-gray-800 border-amber-500' : 'bg-white border-amber-400'} border-2 rounded-2xl p-6 max-w-md w-full shadow-2xl`}
+                                onClick={(e) => e.stopPropagation()}
+                            >
+                                <div className="flex items-center justify-center mb-4">
+                                    <div className={`w-16 h-16 rounded-full flex items-center justify-center ${darkMode ? 'bg-amber-900 bg-opacity-50' : 'bg-amber-100'}`}>
+                                        <i className={`fas fa-exclamation-triangle text-3xl ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}></i>
+                                    </div>
+                                </div>
+
+                                <h2 className={`text-xl font-bold text-center mb-3 ${darkMode ? 'text-amber-300' : 'text-amber-700'}`}>
+                                    Deploy Required
+                                </h2>
+
+                                <div className={`p-4 rounded-lg mb-4 ${darkMode ? 'bg-gray-700' : 'bg-gray-100'}`}>
+                                    <p className={`text-sm text-center ${darkMode ? 'text-gray-200' : 'text-gray-700'}`}>
+                                        <strong className={darkMode ? 'text-amber-300' : 'text-amber-700'}>Lookup</strong>
+                                        {' '}<span className="font-mono">"{pendingLookupDeleteDeploy.filename}"</span>{' '}
+                                        was deleted from <strong>{pendingLookupDeleteDeploy.workerGroup}</strong>.
+                                    </p>
+                                    <p className={`text-xs text-center mt-2 ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                                        You must deploy this change before making any other modifications.
+                                    </p>
+                                </div>
+
+                                <button
+                                    onClick={async () => {
+                                        if (deployingPendingLookup) return;
+                                        setDeployingPendingLookup(true);
+
+                                        const { workerGroup, apiType } = pendingLookupDeleteDeploy;
+                                        addConsoleLog(`[DEPLOY] Deploying deletion to ${workerGroup}...`, 'info');
+
+                                        try {
+                                            addCommandToHistory('POST', `${API_BASE}/api/deploy`, `Deploy to ${workerGroup}`, apiType, workerGroup);
+                                            const res = await fetch(`${API_BASE}/api/deploy`, {
+                                                method: 'POST',
+                                                headers: { 'Content-Type': 'application/json' },
+                                                body: JSON.stringify({
+                                                    worker_group: workerGroup,
+                                                    api_type: apiType
+                                                })
+                                            });
+                                            const data = await res.json();
+
+                                            if (data.success) {
+                                                addConsoleLog(`[SUCCESS] Deployed deletion to ${workerGroup}`, 'success');
+                                                showMessage('Deployed successfully', 'success');
+                                                updateActivityLog('success', `Deleted and deployed: ${pendingLookupDeleteDeploy.filename}`,
+                                                    [`Source: ${workerGroup}`]);
+                                                setPendingLookupDeleteDeploy(null);
+                                            } else {
+                                                addConsoleLog(`[ERROR] Deploy failed: ${data.error || 'Unknown error'}`, 'error');
+                                                showMessage(`Deploy failed: ${data.error || 'Unknown error'}`, 'error');
+                                            }
+                                        } catch (error) {
+                                            addConsoleLog(`[ERROR] Deploy error: ${error.message}`, 'error');
+                                            showMessage(`Deploy error: ${error.message}`, 'error');
+                                        } finally {
+                                            setDeployingPendingLookup(false);
+                                        }
+                                    }}
+                                    disabled={deployingPendingLookup}
+                                    className={`w-full py-3 text-sm font-semibold rounded-lg transition-all flex items-center justify-center space-x-2 ${
+                                        deployingPendingLookup
+                                            ? 'bg-gray-400 cursor-not-allowed text-white'
+                                            : 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg'
+                                    }`}
+                                >
+                                    {deployingPendingLookup ? (
+                                        <>
+                                            <i className="fas fa-spinner fa-spin"></i>
                                             <span>Deploying...</span>
                                         </>
                                     ) : (

@@ -49,7 +49,7 @@ API Endpoints:
 
 # Set to True to enable verbose debug logging to console
 # When False, only essential startup/error messages are printed
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 # =============================================================================
 # IMPORTS - Standard Library
