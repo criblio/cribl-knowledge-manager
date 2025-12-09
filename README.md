@@ -2,6 +2,8 @@
 
 A web-based tool for managing and transferring knowledge objects across Cribl Cloud environments (Stream, Search, and Edge).
 
+**Version: 4.0.0** | December 2025
+
 > **Note:** This tool supports **Cribl Cloud only**. On-premises Cribl deployments are not supported.
 
 ## Features

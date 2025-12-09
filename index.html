@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Knowledge Manager v0.1.0</title>
-    <!-- Version 0.1.0 - December 4, 2025 -->
+    <title>Knowledge Manager v4.0.0</title>
+    <!-- Version 4.0.0 - December 2025 -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -239,7 +239,55 @@
             const [authenticated, setAuthenticated] = useState(false);
             const [loading, setLoading] = useState(true);
             const [hasConfig, setHasConfig] = useState(false);
-            
+
+            // Marketplace state
+            const [marketplaceFeeds, setMarketplaceFeeds] = useState([]);
+            const [marketplaceProviders, setMarketplaceProviders] = useState([]);
+            const [marketplaceLoading, setMarketplaceLoading] = useState(false);
+            const [showAddFeedModal, setShowAddFeedModal] = useState(false);
+            const [editingFeed, setEditingFeed] = useState(null);
+            const [feedSyncStatus, setFeedSyncStatus] = useState({});
+            const [feedPreview, setFeedPreview] = useState(null); // {feedId, feedName, headers, rows, total_count}
+            const [feedViewMode, setFeedViewMode] = useState('tile'); // 'tile' or 'list'
+            const [feedCategoryFilter, setFeedCategoryFilter] = useState('all'); // Category filter for marketplace
+            const [feedSearchFilter, setFeedSearchFilter] = useState(''); // Search filter for marketplace
+            const [feedPage, setFeedPage] = useState(1); // Pagination for marketplace feeds
+            const FEEDS_PER_PAGE = 10; // Items per page (10 for list, 10 for tiles ~2 rows)
+
+            // Category definitions for feed filtering
+            const feedCategories = {
+                all: { label: 'All Feeds', icon: 'fa-globe' },
+                ip_blocklist: { label: 'IP Blocklists', icon: 'fa-ban', match: ['ip_blocklist'] },
+                botnet_c2: { label: 'Botnet/C2', icon: 'fa-skull-crossbones', match: ['botnet_c2', 'threat_intel'] },
+                malware: { label: 'Malware', icon: 'fa-virus', match: ['malware_urls', 'malware_hashes', 'malware_domains', 'malware_iocs', 'ransomware'] },
+                phishing: { label: 'Phishing', icon: 'fa-fish', match: ['phishing'] },
+                anonymizer: { label: 'Tor/Proxy', icon: 'fa-user-secret', match: ['anonymizer', 'proxy'] },
+                domain_ranking: { label: 'Domain Rankings', icon: 'fa-trophy', match: ['domain_ranking'] },
+                cloud_provider: { label: 'Cloud IPs', icon: 'fa-cloud', match: ['cloud_provider', 'cdn'] },
+                geolocation: { label: 'GeoIP', icon: 'fa-map-marker-alt', match: ['geolocation', 'network_intel'] },
+                reference: { label: 'Reference', icon: 'fa-book', match: ['reference', 'vulnerabilities', 'vulnerability'] },
+                requires_key: { label: 'API Key Required', icon: 'fa-key', match: ['requires_api_key'] }
+            };
+
+            // Feed form state for controlled modal
+            const [feedFormApiType, setFeedFormApiType] = useState('stream');
+            const [selectedFeedTargetGroups, setSelectedFeedTargetGroups] = useState(new Set()); // Multi-select for feed targets
+            const [feedFormWorkerGroups, setFeedFormWorkerGroups] = useState([]);
+            const [feedFormScheduleDays, setFeedFormScheduleDays] = useState(['0','1','2','3','4','5','6']);
+            const [feedFormScheduleHour, setFeedFormScheduleHour] = useState('6');
+            const [feedFormScheduleMinute, setFeedFormScheduleMinute] = useState('0');
+            const [feedFormCronPreview, setFeedFormCronPreview] = useState('0 6 * * *');
+            const [feedFormProviderId, setFeedFormProviderId] = useState(''); // Track selected provider for description/auth display
+            const [showFeedTypeSelector, setShowFeedTypeSelector] = useState(false); // Show free vs auth-required selection
+            const [feedTypeFilter, setFeedTypeFilter] = useState(null); // 'free' or 'auth' - filters providers in Add Feed modal
+
+            // Marketplace Console and CURL panels state
+            const [marketplaceConsoleLogs, setMarketplaceConsoleLogs] = useState([]);
+            const [marketplaceConsoleMinimized, setMarketplaceConsoleMinimized] = useState(true);
+            const [marketplaceCurlMinimized, setMarketplaceCurlMinimized] = useState(true);
+            const [marketplaceShowSensitive, setMarketplaceShowSensitive] = useState(false);
+            const [marketplaceCurlHistory, setMarketplaceCurlHistory] = useState([]);
+
             // Auth state
             const [clientId, setClientId] = useState('');
             const [clientSecret, setClientSecret] = useState('');
@@ -336,6 +384,8 @@
             const [knowledgeShowSensitive, setKnowledgeShowSensitive] = useState(false);
             const [knowledgeTestResults, setKnowledgeTestResults] = useState({});
             const [knowledgeTestingCommand, setKnowledgeTestingCommand] = useState(null);
+            const [marketplaceTestResults, setMarketplaceTestResults] = useState({});
+            const [marketplaceTestingCommand, setMarketplaceTestingCommand] = useState(null);
 
             // Knowledge Editor state
             const [knowledgeEditorMinimized, setKnowledgeEditorMinimized] = useState(true);
@@ -381,19 +431,431 @@
             const [savedLookupContent, setSavedLookupContent] = useState('');
             const [deploymentComplete, setDeploymentComplete] = useState(false);
             const [hasTransferredFile, setHasTransferredFile] = useState(false);
+            const [pendingLookupTransferDeploy, setPendingLookupTransferDeploy] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('pendingLookupTransferDeploy');
+                    return saved ? JSON.parse(saved) : null;
+                } catch { return null; }
+            }); // Track pending deploy after lookup transfer: {workerGroup, apiType, commitId}
             const [lastTransferredTargets, setLastTransferredTargets] = useState([]); // Track targets from last transfer for deploy
             const [preserveCommitMessage, setPreserveCommitMessage] = useState(false); // Prevent auto-clear of commit message after transfer
-            const [pendingKnowledgeDeploy, setPendingKnowledgeDeploy] = useState(null); // Track pending deploy after delete: {workerGroup, apiType, message}
+            // Initialize pending deploy states from localStorage (survives page refresh)
+            const [pendingKnowledgeDeploy, setPendingKnowledgeDeploy] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('pendingKnowledgeDeploy');
+                    return saved ? JSON.parse(saved) : null;
+                } catch { return null; }
+            }); // Track pending deploy after delete: {workerGroup, apiType, message}
             const [deployingPendingKnowledge, setDeployingPendingKnowledge] = useState(false); // Track if modal deploy is in progress
             const [knowledgeDeployComplete, setKnowledgeDeployComplete] = useState(false); // Track if knowledge deploy completed (gray out button)
             const [knowledgeActivityLog, setKnowledgeActivityLog] = useState({ type: null, message: '', details: [], timestamp: null }); // Activity log for Knowledge panel
             const [pendingDeployments, setPendingDeployments] = useState([]); // Array of pending deployments: {filename, targetGroup, targetApiType, commitId}
             const [showAllPending, setShowAllPending] = useState(false); // For expandable pending deployments UI
-            const [pendingLookupDeleteDeploy, setPendingLookupDeleteDeploy] = useState(null); // Track pending deploy after lookup delete: {workerGroup, apiType, filename}
+            const [pendingLookupDeleteDeploy, setPendingLookupDeleteDeploy] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('pendingLookupDeleteDeploy');
+                    return saved ? JSON.parse(saved) : null;
+                } catch { return null; }
+            }); // Track pending deploy after lookup delete: {workerGroup, apiType, filename}
             const [deployingPendingLookup, setDeployingPendingLookup] = useState(false); // Track if lookup delete deploy is in progress
             const [targetVersion, setTargetVersion] = useState(null);
             const [showApiTokenHelp, setShowApiTokenHelp] = useState(false);
             const [showReadme, setShowReadme] = useState(false);
+
+            // Marketplace API functions
+            const loadMarketplaceProviders = async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/providers`);
+                    const data = await res.json();
+                    if (data.providers) {
+                        setMarketplaceProviders(data.providers);
+                    }
+                } catch (error) {
+                    console.error('Error loading marketplace providers:', error);
+                }
+            };
+
+            const loadMarketplaceFeeds = async () => {
+                setMarketplaceLoading(true);
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/feeds`);
+                    const data = await res.json();
+                    if (data.feeds) {
+                        setMarketplaceFeeds(data.feeds);
+                    }
+                } catch (error) {
+                    console.error('Error loading marketplace feeds:', error);
+                    showMessage('Error loading feeds: ' + error.message, 'error');
+                } finally {
+                    setMarketplaceLoading(false);
+                }
+            };
+
+            const createFeed = async (feedData) => {
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/feeds`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(feedData)
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        showMessage('Error creating feed: ' + data.error, 'error');
+                        return false;
+                    }
+                    showMessage('Feed created successfully', 'success');
+                    await loadMarketplaceFeeds();
+                    return true;
+                } catch (error) {
+                    showMessage('Error creating feed: ' + error.message, 'error');
+                    return false;
+                }
+            };
+
+            const updateFeed = async (feedId, feedData) => {
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/feeds/${feedId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(feedData)
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        showMessage('Error updating feed: ' + data.error, 'error');
+                        return false;
+                    }
+                    showMessage('Feed updated successfully', 'success');
+                    await loadMarketplaceFeeds();
+                    return true;
+                } catch (error) {
+                    showMessage('Error updating feed: ' + error.message, 'error');
+                    return false;
+                }
+            };
+
+            const deleteFeed = async (feedId) => {
+                if (!confirm('Are you sure you want to delete this feed?')) return;
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/feeds/${feedId}`, {
+                        method: 'DELETE'
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        showMessage('Error deleting feed: ' + data.error, 'error');
+                        return;
+                    }
+                    showMessage('Feed deleted successfully', 'success');
+                    await loadMarketplaceFeeds();
+                } catch (error) {
+                    showMessage('Error deleting feed: ' + error.message, 'error');
+                }
+            };
+
+            const syncFeed = async (feedId, feedName) => {
+                // Check if this feed requires an API key
+                const feed = marketplaceFeeds.find(f => f.id === feedId);
+                const provider = feed ? marketplaceProviders.find(p => p.id === feed.provider_id) : null;
+
+                // Check if provider requires authentication but no key is configured
+                if (provider && provider.auth_type && provider.auth_type !== 'none') {
+                    if (!feed.api_key) {
+                        const providerName = provider.name || feed.provider_id;
+                        const signupUrl = provider.signup_url;
+                        const message = signupUrl
+                            ? `"${providerName}" requires an API key. Get one at: ${signupUrl}\n\nEdit this feed to add your API key before syncing.`
+                            : `"${providerName}" requires an API key. Please edit this feed to configure your API key before syncing.`;
+                        showMessage(message, 'error');
+                        addMarketplaceConsoleLog(`Sync blocked: ${providerName} requires API key`, 'error');
+                        return;
+                    }
+                }
+
+                setFeedSyncStatus(prev => ({ ...prev, [feedId]: 'syncing' }));
+                const syncUrl = `${API_BASE}/api/marketplace/feeds/${feedId}/sync`;
+                addMarketplaceConsoleLog(`Syncing feed: ${feedName || feedId}`, 'info');
+                addMarketplaceCurlCommand('POST', syncUrl, `Sync feed: ${feedName || feedId}`);
+                try {
+                    const res = await fetch(syncUrl, {
+                        method: 'POST'
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        addMarketplaceConsoleLog(`Sync failed: ${data.error}`, 'error');
+                        showMessage('Sync failed: ' + data.error, 'error');
+                        setFeedSyncStatus(prev => ({ ...prev, [feedId]: 'error' }));
+                        return;
+                    }
+                    addMarketplaceConsoleLog(`Sync completed: ${data.message || 'Success'}`, 'success');
+                    showMessage(data.message || 'Sync completed', 'success');
+                    setFeedSyncStatus(prev => ({ ...prev, [feedId]: 'success' }));
+                    // Store preview data if available
+                    if (data.preview) {
+                        setFeedPreview({
+                            feedId,
+                            feedName: feedName || `Feed ${feedId}`,
+                            ...data.preview
+                        });
+                        addMarketplaceConsoleLog(`Preview loaded: ${data.preview.total_count || 0} records`, 'info');
+                    }
+                    await loadMarketplaceFeeds();
+                    setTimeout(() => {
+                        setFeedSyncStatus(prev => ({ ...prev, [feedId]: null }));
+                    }, 3000);
+                } catch (error) {
+                    addMarketplaceConsoleLog(`Sync error: ${error.message}`, 'error');
+                    showMessage('Sync error: ' + error.message, 'error');
+                    setFeedSyncStatus(prev => ({ ...prev, [feedId]: 'error' }));
+                }
+            };
+
+            const toggleFeedEnabled = async (feedId, enabled) => {
+                try {
+                    const res = await fetch(`${API_BASE}/api/marketplace/feeds/${feedId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled })
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        showMessage('Error updating feed: ' + data.error, 'error');
+                        return;
+                    }
+                    await loadMarketplaceFeeds();
+                } catch (error) {
+                    showMessage('Error updating feed: ' + error.message, 'error');
+                }
+            };
+
+            // Initialize feed form when modal opens
+            useEffect(() => {
+                if (showAddFeedModal) {
+                    if (editingFeed) {
+                        // Editing existing feed - populate form state
+                        setFeedFormApiType(editingFeed.target_api_type || 'stream');
+                        setFeedFormProviderId(editingFeed.provider_id || '');
+                        // Parse existing target worker groups - could be JSON array or single string
+                        const existingGroups = editingFeed.target_worker_groups || editingFeed.target_worker_group || '';
+                        let groupsSet = new Set();
+                        if (existingGroups) {
+                            try {
+                                const parsed = JSON.parse(existingGroups);
+                                if (Array.isArray(parsed)) {
+                                    parsed.forEach(g => g && groupsSet.add(g));
+                                }
+                            } catch {
+                                // Not JSON, treat as single string (legacy format: "api_type/group_name")
+                                if (existingGroups.includes('/')) {
+                                    groupsSet.add(existingGroups.split('/')[1]);
+                                } else if (existingGroups) {
+                                    groupsSet.add(existingGroups);
+                                }
+                            }
+                        }
+                        setSelectedFeedTargetGroups(groupsSet);
+                        // Parse schedule
+                        const cron = editingFeed.schedule_cron || '0 6 * * *';
+                        const parts = cron.split(' ');
+                        if (parts.length >= 5) {
+                            setFeedFormScheduleMinute(parts[0] || '0');
+                            setFeedFormScheduleHour(parts[1] || '6');
+                            const days = parts[4] === '*' ? ['0','1','2','3','4','5','6'] : parts[4].split(',');
+                            setFeedFormScheduleDays(days);
+                            setFeedFormCronPreview(cron);
+                        }
+                    } else {
+                        // Adding new feed - reset to defaults
+                        setFeedFormApiType('stream');
+                        setFeedFormProviderId('');
+                        setSelectedFeedTargetGroups(new Set());
+                        setFeedFormScheduleDays(['0','1','2','3','4','5','6']);
+                        setFeedFormScheduleHour('6');
+                        setFeedFormScheduleMinute('0');
+                        setFeedFormCronPreview('0 6 * * *');
+                    }
+                }
+            }, [showAddFeedModal, editingFeed]);
+
+            // Fetch worker groups when API type changes in feed form
+            useEffect(() => {
+                const fetchFeedFormWorkerGroups = async () => {
+                    if (!authenticated || feedFormApiType === 'search') {
+                        setFeedFormWorkerGroups([]);
+                        return;
+                    }
+                    try {
+                        const endpoint = feedFormApiType === 'edge' ? 'fleets' : 'worker-groups';
+                        const res = await fetch(`${API_BASE}/api/${endpoint}?api_type=${feedFormApiType}`);
+                        const data = await res.json();
+                        if (data.groups && data.groups.length > 0) {
+                            setFeedFormWorkerGroups(data.groups);
+                        } else {
+                            setFeedFormWorkerGroups(['default']);
+                        }
+                    } catch (e) {
+                        console.warn('Could not fetch worker groups for feed form:', e);
+                    }
+                };
+                if (showAddFeedModal) {
+                    fetchFeedFormWorkerGroups();
+                }
+            }, [showAddFeedModal, feedFormApiType, authenticated]);
+
+            // Update cron preview when schedule inputs change
+            useEffect(() => {
+                const dayOfWeek = feedFormScheduleDays.length === 7 || feedFormScheduleDays.length === 0 ? '*' : feedFormScheduleDays.join(',');
+                const cron = `${feedFormScheduleMinute} ${feedFormScheduleHour} * * ${dayOfWeek}`;
+                setFeedFormCronPreview(cron);
+            }, [feedFormScheduleDays, feedFormScheduleHour, feedFormScheduleMinute]);
+
+            // Persist pending deploy states to localStorage so they survive page refresh
+            useEffect(() => {
+                if (pendingKnowledgeDeploy) {
+                    localStorage.setItem('pendingKnowledgeDeploy', JSON.stringify(pendingKnowledgeDeploy));
+                } else {
+                    localStorage.removeItem('pendingKnowledgeDeploy');
+                }
+            }, [pendingKnowledgeDeploy]);
+
+            useEffect(() => {
+                if (pendingLookupDeleteDeploy) {
+                    localStorage.setItem('pendingLookupDeleteDeploy', JSON.stringify(pendingLookupDeleteDeploy));
+                } else {
+                    localStorage.removeItem('pendingLookupDeleteDeploy');
+                }
+            }, [pendingLookupDeleteDeploy]);
+
+            useEffect(() => {
+                if (pendingLookupTransferDeploy) {
+                    localStorage.setItem('pendingLookupTransferDeploy', JSON.stringify(pendingLookupTransferDeploy));
+                    // Restore hasTransferredFile state when loading from localStorage
+                    setHasTransferredFile(true);
+                } else {
+                    localStorage.removeItem('pendingLookupTransferDeploy');
+                }
+            }, [pendingLookupTransferDeploy]);
+
+            // Verify localStorage pending states against Cribl API when user logs in
+            // This handles the case where someone deployed via Cribl UI directly
+            // Uses commit ID comparison when available, falls back to pending changes check
+            useEffect(() => {
+                const verifyPendingChanges = async () => {
+                    // Check pendingKnowledgeDeploy
+                    // Knowledge deletes don't have commitId initially, so use pending-changes fallback
+                    if (pendingKnowledgeDeploy) {
+                        const { workerGroup, apiType, commitId } = pendingKnowledgeDeploy;
+                        try {
+                            if (commitId) {
+                                // Use commit verification endpoint
+                                const res = await fetch(`${API_BASE}/api/verify-km-commit?worker_group=${encodeURIComponent(workerGroup)}&api_type=${apiType}&commit_id=${encodeURIComponent(commitId)}`);
+                                const data = await res.json();
+                                if (data.success && data.should_clear) {
+                                    console.log('[VERIFY] Knowledge commit superseded by newer commit, clearing localStorage');
+                                    console.log(`[VERIFY] Stored: ${commitId}, Current: ${data.current_version}`);
+                                    setPendingKnowledgeDeploy(null);
+                                } else if (data.success && data.still_valid) {
+                                    console.log('[VERIFY] Knowledge commit still pending deployment');
+                                }
+                            } else {
+                                // Fallback: check for uncommitted changes (for knowledge items without commitId)
+                                const res = await fetch(`${API_BASE}/api/pending-changes?worker_group=${encodeURIComponent(workerGroup)}&api_type=${apiType}`);
+                                const data = await res.json();
+                                if (data.success && data.pending_count === 0) {
+                                    console.log('[VERIFY] No pending changes for knowledge deploy, clearing localStorage');
+                                    setPendingKnowledgeDeploy(null);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn('[VERIFY] Could not verify pending knowledge changes:', e);
+                        }
+                    }
+
+                    // Check pendingLookupDeleteDeploy
+                    // Lookup deletes have commitId from the auto-commit response
+                    if (pendingLookupDeleteDeploy) {
+                        const { workerGroup, apiType, commitId } = pendingLookupDeleteDeploy;
+                        try {
+                            if (commitId) {
+                                // Use commit verification endpoint
+                                const res = await fetch(`${API_BASE}/api/verify-km-commit?worker_group=${encodeURIComponent(workerGroup)}&api_type=${apiType}&commit_id=${encodeURIComponent(commitId)}`);
+                                const data = await res.json();
+                                if (data.success && data.should_clear) {
+                                    console.log('[VERIFY] Lookup commit superseded by newer commit, clearing localStorage');
+                                    console.log(`[VERIFY] Stored: ${commitId}, Current: ${data.current_version}`);
+                                    setPendingLookupDeleteDeploy(null);
+                                } else if (data.success && data.still_valid) {
+                                    console.log('[VERIFY] Lookup commit still pending deployment');
+                                }
+                            } else {
+                                // Fallback: check for uncommitted changes
+                                const res = await fetch(`${API_BASE}/api/pending-changes?worker_group=${encodeURIComponent(workerGroup)}&api_type=${apiType}`);
+                                const data = await res.json();
+                                if (data.success && data.pending_count === 0) {
+                                    console.log('[VERIFY] No pending changes for lookup deploy, clearing localStorage');
+                                    setPendingLookupDeleteDeploy(null);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn('[VERIFY] Could not verify pending lookup changes:', e);
+                        }
+                    }
+
+                    // Check pendingLookupTransferDeploy
+                    // Lookup transfers have commitId from the auto-commit response
+                    // Handle both old format (single workerGroup) and new format (targets array)
+                    if (pendingLookupTransferDeploy) {
+                        const { apiType, targets, workerGroup, commitId } = pendingLookupTransferDeploy;
+                        try {
+                            // Build list of targets to verify
+                            const targetsToVerify = targets
+                                ? targets.filter(t => t.commitId)
+                                : (workerGroup && commitId ? [{ workerGroup, commitId }] : []);
+
+                            if (targetsToVerify.length > 0) {
+                                // Check each target - keep any that are still pending
+                                const stillPendingTargets = [];
+                                for (const target of targetsToVerify) {
+                                    const res = await fetch(`${API_BASE}/api/verify-km-commit?worker_group=${encodeURIComponent(target.workerGroup)}&api_type=${apiType}&commit_id=${encodeURIComponent(target.commitId)}`);
+                                    const data = await res.json();
+                                    if (data.success && data.still_valid) {
+                                        stillPendingTargets.push(target);
+                                        console.log(`[VERIFY] Transfer to ${target.workerGroup} still pending deployment`);
+                                    } else if (data.success && data.should_clear) {
+                                        console.log(`[VERIFY] Transfer to ${target.workerGroup} superseded by newer commit`);
+                                    }
+                                }
+
+                                if (stillPendingTargets.length === 0) {
+                                    // All targets have been deployed
+                                    console.log('[VERIFY] All transfer commits deployed, clearing localStorage');
+                                    setPendingLookupTransferDeploy(null);
+                                    setHasTransferredFile(false);
+                                } else if (stillPendingTargets.length < targetsToVerify.length) {
+                                    // Some targets deployed, update to only pending ones
+                                    console.log(`[VERIFY] ${targetsToVerify.length - stillPendingTargets.length} targets deployed, ${stillPendingTargets.length} still pending`);
+                                    setPendingLookupTransferDeploy({ apiType, targets: stillPendingTargets });
+                                    setHasTransferredFile(true);
+                                } else {
+                                    // All targets still pending
+                                    setHasTransferredFile(true);
+                                }
+                            } else {
+                                // No commitId means we can't verify - just restore the state
+                                console.log('[VERIFY] Transfer has no commitId, restoring state');
+                                setHasTransferredFile(true);
+                            }
+                        } catch (e) {
+                            console.warn('[VERIFY] Could not verify pending transfer changes:', e);
+                            // On error, preserve the state to be safe
+                            setHasTransferredFile(true);
+                        }
+                    }
+                };
+
+                // Only verify when logged in
+                if (authenticated) {
+                    verifyPendingChanges();
+                }
+            }, [authenticated]); // Run when login state changes
 
             // Help icon component with tooltip
             const HelpIcon = ({ tooltip }) => (
@@ -408,6 +870,18 @@
             const addConsoleLog = (message, type = 'info') => {
                 const timestamp = new Date().toLocaleTimeString();
                 setConsoleLogs(prev => [...prev, { message, type, timestamp }]);
+            };
+
+            // Marketplace console and curl command logging
+            const addMarketplaceConsoleLog = (message, type = 'info') => {
+                const timestamp = new Date().toLocaleTimeString();
+                setMarketplaceConsoleLogs(prev => [...prev, { message, type, timestamp }]);
+            };
+
+            const addMarketplaceCurlCommand = (method, url, description) => {
+                const timestamp = new Date().toLocaleTimeString();
+                const id = Date.now();
+                setMarketplaceCurlHistory(prev => [{ id, method, url, description, timestamp }, ...prev]);
             };
 
             // Helper function to strip pack prefix from lookup names
@@ -865,6 +1339,102 @@
                 }
             };
 
+            // Test API call for marketplace curl commands
+            const testMarketplaceApiCall = async (commandId, url, method = 'GET') => {
+                setMarketplaceTestingCommand(commandId);
+                addMarketplaceConsoleLog(`[TEST] Testing API call: ${method} ${url}`, 'info');
+                try {
+                    // Extract API type and worker group from URL for the test endpoint
+                    const urlObj = new URL(url);
+                    const pathParts = urlObj.pathname.split('/');
+                    let api_type = 'stream';
+                    let worker_group = null;
+
+                    // Determine API type from path
+                    if (pathParts.includes('f')) {
+                        api_type = 'edge';
+                        const fIndex = pathParts.indexOf('f');
+                        if (fIndex >= 0 && pathParts.length > fIndex + 1) {
+                            worker_group = pathParts[fIndex + 1];
+                        }
+                    } else if (pathParts.includes('m')) {
+                        const mIndex = pathParts.indexOf('m');
+                        if (mIndex >= 0 && pathParts.length > mIndex + 1) {
+                            worker_group = pathParts[mIndex + 1];
+                        }
+                        if (worker_group === 'default_search' || urlObj.pathname.includes('search')) {
+                            api_type = 'search';
+                        }
+                    }
+
+                    // Use backend test endpoint
+                    const response = await fetch(`${API_BASE}/api/test-curl`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            api_type: api_type,
+                            worker_group: worker_group
+                        })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    const result = await response.json();
+
+                    if (result.success && result.results) {
+                        const allPassed = result.results.every(r => r.success);
+                        const passedCount = result.results.filter(r => r.success).length;
+                        const totalCount = result.results.length;
+
+                        setMarketplaceTestResults(prev => ({
+                            ...prev,
+                            [commandId]: {
+                                status: allPassed ? 200 : 'mixed',
+                                statusText: `${passedCount}/${totalCount} tests passed`,
+                                data: result.results,
+                                timestamp: new Date().toLocaleTimeString()
+                            }
+                        }));
+
+                        if (allPassed) {
+                            addMarketplaceConsoleLog(`[OK] All tests successful: ${passedCount}/${totalCount} passed`, 'success');
+                            showMessage(`[OK] All tests passed (${passedCount}/${totalCount})`, 'success');
+                        } else {
+                            addMarketplaceConsoleLog(`[WARNING] Some tests failed: ${passedCount}/${totalCount} passed`, 'warning');
+                            showMessage(`[WARNING] ${passedCount}/${totalCount} tests passed`, 'warning');
+                        }
+
+                        result.results.forEach(test => {
+                            if (test.success) {
+                                addMarketplaceConsoleLog(`  ✓ ${test.endpoint}: ${test.message}`, 'success');
+                            } else {
+                                addMarketplaceConsoleLog(`  ✗ ${test.endpoint}: ${test.message}`, 'error');
+                            }
+                        });
+                    } else {
+                        throw new Error(result.error || 'Test failed');
+                    }
+                } catch (error) {
+                    addMarketplaceConsoleLog(`[ERROR] Test failed: ${error.message}`, 'error');
+                    setMarketplaceTestResults(prev => ({
+                        ...prev,
+                        [commandId]: {
+                            status: 'error',
+                            statusText: 'Failed',
+                            error: error.message,
+                            timestamp: new Date().toLocaleTimeString()
+                        }
+                    }));
+                    showMessage(`[ERROR] Test failed: ${error.message}`, 'error');
+                } finally {
+                    setMarketplaceTestingCommand(null);
+                }
+            };
+
             useEffect(() => {
                 // Reload worker groups when API type changes (skip for Search - it uses default_search)
                 if (authenticated && sourceApiType !== 'search') {
@@ -940,6 +1510,42 @@
                     return prev;
                 });
             }, [targetApiType]);
+
+            // Auto-select destination from localStorage when pending transfer deploy exists
+            // This runs when target groups load and there's a pending deploy to restore
+            useEffect(() => {
+                if (pendingLookupTransferDeploy && targetGroups.length > 0 && authenticated) {
+                    const { apiType, targets } = pendingLookupTransferDeploy;
+                    // Handle both old format (workerGroup) and new format (targets array)
+                    const workerGroups = targets
+                        ? targets.map(t => t.workerGroup)
+                        : pendingLookupTransferDeploy.workerGroup
+                            ? [pendingLookupTransferDeploy.workerGroup]
+                            : [];
+
+                    if (workerGroups.length === 0) return;
+
+                    // Only restore if we're on the right API type or need to switch
+                    if (apiType && apiType !== targetApiType) {
+                        // Switch to the correct API type first (this will trigger a re-fetch of target groups)
+                        setTargetApiType(apiType);
+                        console.log(`[RESTORE] Switching target API type to ${apiType} for pending deployment`);
+                        return; // Wait for the API type change to trigger group reload
+                    }
+
+                    // Find which worker groups exist in the loaded target groups
+                    const existingGroups = workerGroups.filter(wg => targetGroups.some(g => g.id === wg));
+                    const currentSelected = Array.from(selectedTargetGroups);
+                    const needsUpdate = existingGroups.some(wg => !selectedTargetGroups.has(wg));
+
+                    if (existingGroups.length > 0 && needsUpdate) {
+                        setSelectedTargetGroups(new Set(existingGroups));
+                        setSelectedTargetGroup(existingGroups[0]); // Set first one as primary
+                        console.log(`[RESTORE] Auto-selected destinations: ${existingGroups.join(', ')} from pending transfer deploy`);
+                        addConsoleLog(`[INFO] Restored pending deployment destinations: ${existingGroups.join(', ')}`, 'info');
+                    }
+                }
+            }, [pendingLookupTransferDeploy, targetGroups, authenticated, targetApiType]);
 
             useEffect(() => {
                 if (selectedSourceGroup && authenticated) {
@@ -2329,8 +2935,8 @@
                             const data = await res.json();
 
                             if (data.success) {
-                                targetResults.push({ filename: lookupFilename, success: true });
-                                results.push({ filename: lookupFilename, targetGroup, success: true });
+                                targetResults.push({ filename: lookupFilename, success: true, commitId: data.commit_id });
+                                results.push({ filename: lookupFilename, targetGroup, success: true, commitId: data.commit_id, apiType: data.target_api_type || targetApiType });
                                 addConsoleLog(`[OK] ${lookupFilename} -> ${targetGroup}`, 'success');
                             } else {
                                 targetResults.push({ filename: lookupFilename, success: false, error: data.error });
@@ -2358,6 +2964,29 @@
 
                 // Save the targets we transferred to (for the Deploy button)
                 setLastTransferredTargets([...targetGroupsList]);
+
+                // Store pending transfer deploy info (for page refresh persistence)
+                // Collect all successful transfers with commit IDs, grouped by worker group
+                // MERGE with existing pending deployments so we don't lose prior transfers
+                const successfulByGroup = {};
+                // First, preserve existing pending targets (if any)
+                if (pendingLookupTransferDeploy?.targets) {
+                    pendingLookupTransferDeploy.targets.forEach(t => {
+                        successfulByGroup[t.workerGroup] = t;
+                    });
+                }
+                // Then add/update with new successful transfers
+                results.filter(r => r.success && r.commitId).forEach(r => {
+                    // Update the commitId for this worker group (newer transfer takes precedence)
+                    successfulByGroup[r.targetGroup] = { workerGroup: r.targetGroup, commitId: r.commitId };
+                });
+                const targets = Object.values(successfulByGroup);
+                if (targets.length > 0) {
+                    setPendingLookupTransferDeploy({
+                        apiType: targetApiType,
+                        targets: targets
+                    });
+                }
 
                 const successCount = results.filter(r => r.success).length;
                 const failCount = results.filter(r => !r.success).length;
@@ -2736,6 +3365,7 @@
                 setDeploymentComplete(true);
                 setLastTransferredTargets([]); // Clear after deploy
                 setHasTransferredFile(false);
+                setPendingLookupTransferDeploy(null); // Clear localStorage-persisted state
 
                 // Clear lookup editor
                 setLookupEditorOpen(false);
@@ -2991,10 +3621,12 @@
                             // For Stream/Edge, require user to click Deploy (not Search - it doesn't need deployment)
                             if (sourceApiType !== 'search' && data.committed) {
                                 // Set pending deploy state to lock UI until user deploys
+                                // Include commitId for verification on page reload
                                 setPendingLookupDeleteDeploy({
                                     workerGroup: sourceGroup,
                                     apiType: sourceApiType,
-                                    filename: selectedLookup
+                                    filename: selectedLookup,
+                                    commitId: data.commit_id || null
                                 });
                                 addConsoleLog(`[WARN] Deploy required to complete deletion!`, 'warning');
                                 updateActivityLog('warning', `Deleted: ${selectedLookup} - deploy required`,
@@ -3425,6 +4057,28 @@
                                                 </button>
                                             ))}
                                         </div>
+
+                                        {/* Marketplace Divider and Button */}
+                                        <div className={`my-2 border-t ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}></div>
+                                        {!sidebarCollapsed && (
+                                            <span className={`text-[10px] font-semibold uppercase tracking-wider ${textSecondaryClass} px-1 mb-1 block`}>Feeds</span>
+                                        )}
+                                        <button
+                                            onClick={() => {
+                                                setSelectedKnowledgeType('marketplace');
+                                                loadMarketplaceProviders();
+                                                loadMarketplaceFeeds();
+                                            }}
+                                            className={`w-full flex items-center ${sidebarCollapsed ? 'justify-center px-1' : 'px-2'} py-1.5 rounded-lg text-xs transition-all ${
+                                                selectedKnowledgeType === 'marketplace'
+                                                    ? 'bg-purple-600 text-white'
+                                                    : (darkMode ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-100 text-gray-700')
+                                            }`}
+                                            title="Marketplace"
+                                        >
+                                            <i className={`fas fa-store text-xs ${sidebarCollapsed ? '' : 'mr-2 w-3'}`}></i>
+                                            {!sidebarCollapsed && <span className="truncate">Marketplace</span>}
+                                        </button>
                                     </div>
                                 </div>
 
@@ -4286,6 +4940,39 @@
                                             )}
                                         </div>
 
+                                        {/* Pending Deployment Banner - shows when there's a pending transfer to deploy */}
+                                        {pendingLookupTransferDeploy && hasTransferredFile && !deploymentComplete && (
+                                            <div className={`mb-2 px-3 py-2 rounded-lg text-xs ${darkMode ? 'bg-blue-900/50 border border-blue-700 text-blue-200' : 'bg-blue-50 border border-blue-200 text-blue-800'}`}>
+                                                <div className="flex items-center justify-between">
+                                                    <div className="flex items-center space-x-2">
+                                                        <i className="fas fa-info-circle"></i>
+                                                        <span>
+                                                            <strong>Pending deployment</strong> to{' '}
+                                                            <strong>
+                                                                {pendingLookupTransferDeploy.targets
+                                                                    ? pendingLookupTransferDeploy.targets.map(t => t.workerGroup).join(', ')
+                                                                    : pendingLookupTransferDeploy.workerGroup}
+                                                            </strong>
+                                                            {pendingLookupTransferDeploy.apiType && ` (${pendingLookupTransferDeploy.apiType === 'edge' ? 'Edge' : pendingLookupTransferDeploy.apiType === 'stream' ? 'Stream' : 'Search'})`}
+                                                        </span>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => {
+                                                            if (confirm('Clear pending deployment tracking?\n\nUse this if you will deploy manually via Cribl Cloud UI instead.')) {
+                                                                setPendingLookupTransferDeploy(null);
+                                                                setHasTransferredFile(false);
+                                                                addConsoleLog('[INFO] Cleared pending deployment tracking (deploy manually via Cribl Cloud if needed)', 'info');
+                                                            }
+                                                        }}
+                                                        className={`ml-2 px-2 py-0.5 rounded text-xs ${darkMode ? 'bg-blue-800 hover:bg-blue-700 text-blue-200' : 'bg-blue-100 hover:bg-blue-200 text-blue-700'} transition-all`}
+                                                        title="Clear tracking if deploying via Cribl Cloud UI"
+                                                    >
+                                                        <i className="fas fa-times mr-1"></i>Clear
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
+
                                         {/* Action Buttons with Info - pushed to bottom */}
                                         <div className="mt-auto pt-2">
                                             <div className="flex items-center space-x-2">
@@ -5017,6 +5704,1027 @@
                                     )}
                                 </div>
                                     </div>
+                                    ) : selectedKnowledgeType === 'marketplace' ? (
+                                        /* Marketplace Interface */
+                                        <div className="grid gap-4 min-w-0">
+                                            <div className={`${cardClass} rounded-xl p-4 overflow-hidden`}>
+                                                <div className={`flex items-center justify-between pb-3 mb-3 border-b ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center space-x-3">
+                                                        <div className={`p-2 rounded-lg ${darkMode ? 'bg-purple-900' : 'bg-purple-100'}`}>
+                                                            <i className={`fas fa-store text-lg ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}></i>
+                                                        </div>
+                                                        <div>
+                                                            <h3 className={`text-lg font-bold ${textClass}`}>Marketplace</h3>
+                                                            <p className={`text-xs ${textSecondaryClass}`}>Threat intelligence feed subscriptions</p>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex items-center space-x-3">
+                                                        {/* View Toggle Buttons */}
+                                                        <div className={`flex rounded-lg overflow-hidden border ${darkMode ? 'border-gray-600' : 'border-gray-300'}`}>
+                                                            <button
+                                                                onClick={() => setFeedViewMode('list')}
+                                                                className={`px-3 py-1.5 text-sm ${feedViewMode === 'list' ? 'bg-purple-600 text-white' : (darkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-100 text-gray-600 hover:bg-gray-200')}`}
+                                                                title="List view"
+                                                            >
+                                                                <i className="fas fa-list"></i>
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setFeedViewMode('tile')}
+                                                                className={`px-3 py-1.5 text-sm ${feedViewMode === 'tile' ? 'bg-purple-600 text-white' : (darkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-100 text-gray-600 hover:bg-gray-200')}`}
+                                                                title="Tile view"
+                                                            >
+                                                                <i className="fas fa-th-large"></i>
+                                                            </button>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => setShowFeedTypeSelector(true)}
+                                                            className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg font-semibold transition-all flex items-center space-x-2"
+                                                        >
+                                                            <i className="fas fa-plus"></i>
+                                                            <span>Add Feed</span>
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                {/* Search Filter */}
+                                                <div className="mt-4">
+                                                    <div className="relative">
+                                                        <i className={`fas fa-search absolute left-3 top-1/2 transform -translate-y-1/2 ${textSecondaryClass}`}></i>
+                                                        <input
+                                                            type="text"
+                                                            placeholder="Search feeds by name or provider..."
+                                                            value={feedSearchFilter}
+                                                            onChange={(e) => { setFeedSearchFilter(e.target.value); setFeedPage(1); }}
+                                                            className={`w-full pl-10 pr-8 py-2 rounded-lg border ${inputClass}`}
+                                                        />
+                                                        {feedSearchFilter && (
+                                                            <button
+                                                                onClick={() => setFeedSearchFilter('')}
+                                                                className={`absolute right-3 top-1/2 transform -translate-y-1/2 ${textSecondaryClass} hover:text-red-500`}
+                                                            >
+                                                                <i className="fas fa-times"></i>
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {/* Category Filter Tabs */}
+                                                <div className={`flex flex-wrap gap-2 mt-3 pb-3 border-b ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
+                                                    {Object.entries(feedCategories).map(([key, { label, icon, match }]) => {
+                                                        const count = key === 'all'
+                                                            ? marketplaceFeeds.filter(f => {
+                                                                if (!feedSearchFilter) return true;
+                                                                const provider = marketplaceProviders.find(p => p.id === f.provider_id);
+                                                                const searchLower = feedSearchFilter.toLowerCase();
+                                                                return f.name.toLowerCase().includes(searchLower) ||
+                                                                       (provider?.name || '').toLowerCase().includes(searchLower);
+                                                            }).length
+                                                            : marketplaceFeeds.filter(f => {
+                                                                const provider = marketplaceProviders.find(p => p.id === f.provider_id);
+                                                                const matchesCategory = match ? match.includes(provider?.category) : provider?.category === key;
+                                                                if (!feedSearchFilter) return matchesCategory;
+                                                                const searchLower = feedSearchFilter.toLowerCase();
+                                                                const matchesSearch = f.name.toLowerCase().includes(searchLower) ||
+                                                                                      (provider?.name || '').toLowerCase().includes(searchLower);
+                                                                return matchesCategory && matchesSearch;
+                                                            }).length;
+                                                        return (
+                                                            <button
+                                                                key={key}
+                                                                onClick={() => { setFeedCategoryFilter(key); setFeedPage(1); }}
+                                                                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 border ${
+                                                                    feedCategoryFilter === key
+                                                                        ? 'bg-purple-600 text-white border-purple-600'
+                                                                        : darkMode
+                                                                            ? 'bg-gray-800 text-gray-300 hover:bg-gray-700 border-gray-700'
+                                                                            : 'bg-white text-gray-600 hover:bg-gray-50 border-gray-200'
+                                                                }`}
+                                                            >
+                                                                <i className={`fas ${icon} text-xs`}></i>
+                                                                <span>{label}</span>
+                                                                <span className={`text-xs px-1.5 py-0.5 rounded-full ${
+                                                                    feedCategoryFilter === key
+                                                                        ? 'bg-purple-500'
+                                                                        : darkMode ? 'bg-gray-600' : 'bg-gray-200'
+                                                                }`}>{count}</span>
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+
+                                                {marketplaceLoading ? (
+                                                    <div className="flex items-center justify-center py-12">
+                                                        <div className="spinner w-8 h-8 border-purple-500"></div>
+                                                    </div>
+                                                ) : marketplaceFeeds.length === 0 ? (
+                                                    <div className={`text-center py-12 ${textSecondaryClass}`}>
+                                                        <i className="fas fa-rss text-4xl mb-3 block opacity-50"></i>
+                                                        <p className="text-sm">No feeds configured yet.</p>
+                                                        <p className="text-xs mt-1">Click "Add Feed" to subscribe to threat intelligence feeds.</p>
+                                                    </div>
+                                                ) : feedViewMode === 'list' ? (
+                                                    /* Compact List View */
+                                                    (() => {
+                                                        const filteredFeeds = marketplaceFeeds.filter(feed => {
+                                                            const provider = marketplaceProviders.find(p => p.id === feed.provider_id);
+                                                            if (feedSearchFilter) {
+                                                                const searchLower = feedSearchFilter.toLowerCase();
+                                                                const matchesSearch = feed.name.toLowerCase().includes(searchLower) ||
+                                                                                      (provider?.name || '').toLowerCase().includes(searchLower);
+                                                                if (!matchesSearch) return false;
+                                                            }
+                                                            if (feedCategoryFilter === 'all') return true;
+                                                            const catMatch = feedCategories[feedCategoryFilter]?.match;
+                                                            return catMatch ? catMatch.includes(provider?.category) : provider?.category === feedCategoryFilter;
+                                                        });
+                                                        const totalPages = Math.ceil(filteredFeeds.length / FEEDS_PER_PAGE);
+                                                        const paginatedFeeds = filteredFeeds.slice((feedPage - 1) * FEEDS_PER_PAGE, feedPage * FEEDS_PER_PAGE);
+                                                        return (
+                                                            <div>
+                                                                <div className="space-y-2">
+                                                                    {paginatedFeeds.map(feed => {
+                                                            const provider = marketplaceProviders.find(p => p.id === feed.provider_id);
+                                                            const syncStatus = feedSyncStatus[feed.id];
+                                                            const formatSchedule = () => {
+                                                                const cron = feed.schedule_cron || '0 6 * * *';
+                                                                const parts = cron.split(' ');
+                                                                if (parts.length < 5) return cron;
+                                                                const minute = parts[0], hour = parts[1], dayOfWeek = parts[4];
+                                                                const h = parseInt(hour), m = parseInt(minute);
+                                                                const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+                                                                const ampm = h < 12 ? 'AM' : 'PM';
+                                                                const timeStr = `${hour12}:${String(m).padStart(2, '0')} ${ampm}`;
+                                                                const dayNames = {0:'Sun',1:'Mon',2:'Tue',3:'Wed',4:'Thu',5:'Fri',6:'Sat'};
+                                                                if (dayOfWeek === '*') return `Daily @ ${timeStr}`;
+                                                                const days = dayOfWeek.split(',').map(d => dayNames[d] || d).join('/');
+                                                                return `${days} @ ${timeStr}`;
+                                                            };
+                                                            return (
+                                                                <div key={feed.id} className={`px-3 py-2 rounded-lg border ${darkMode ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                                                    <div className="flex items-center justify-between">
+                                                                        <div className="flex items-center space-x-4 flex-1 min-w-0">
+                                                                            {/* Name and Status */}
+                                                                            <div className="flex items-center space-x-2 min-w-0 flex-shrink-0" style={{width: '200px'}}>
+                                                                                <span className={`font-semibold ${textClass} truncate`}>{feed.name}</span>
+                                                                                {feed.enabled ? (
+                                                                                    <span className="px-1.5 py-0.5 text-[10px] rounded bg-green-600 text-white flex-shrink-0">Active</span>
+                                                                                ) : (
+                                                                                    <span className={`px-1.5 py-0.5 text-[10px] rounded ${darkMode ? 'bg-gray-600' : 'bg-gray-300'} text-gray-200 flex-shrink-0`}>Off</span>
+                                                                                )}
+                                                                            </div>
+                                                                            {/* Details inline */}
+                                                                            <div className={`flex items-center space-x-4 text-xs ${textSecondaryClass} flex-1 min-w-0`}>
+                                                                                <span className="flex-shrink-0" title="Provider"><i className="fas fa-rss mr-1"></i>{provider?.name || feed.provider_id}</span>
+                                                                                <span className="flex-shrink-0" title="Schedule"><i className="fas fa-clock mr-1"></i>{formatSchedule()}</span>
+                                                                                <span className="truncate flex-shrink-0" title="Filename"><i className="fas fa-file mr-1"></i>{feed.lookup_filename}</span>
+                                                                                <span className="flex-shrink-0" title="Target"><i className="fas fa-server mr-1"></i>{feed.target_api_type}/{feed.target_worker_groups || 'default'}</span>
+                                                                                {feed.last_sync_status && (
+                                                                                    <span className={`flex-shrink-0 ${feed.last_sync_status === 'success' ? 'text-green-500' : feed.last_sync_status === 'error' ? 'text-red-500' : ''}`} title={feed.last_sync_message || ''}>
+                                                                                        <i className={`fas ${feed.last_sync_status === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'}`}></i>
+                                                                                    </span>
+                                                                                )}
+                                                                            </div>
+                                                                        </div>
+                                                                        {/* Action buttons */}
+                                                                        <div className="flex items-center space-x-1 ml-2 flex-shrink-0">
+                                                                            <button onClick={() => syncFeed(feed.id, feed.name)} disabled={syncStatus === 'syncing'}
+                                                                                className={`px-2 py-1 text-xs rounded font-semibold transition-all ${syncStatus === 'syncing' ? 'bg-yellow-600' : syncStatus === 'success' ? 'bg-green-600' : syncStatus === 'error' ? 'bg-red-600' : 'bg-blue-600 hover:bg-blue-700'} text-white`} title="Run Now">
+                                                                                <i className={`fas ${syncStatus === 'syncing' ? 'fa-circle-notch fa-spin' : 'fa-play'}`}></i>
+                                                                            </button>
+                                                                            <button onClick={() => toggleFeedEnabled(feed.id, !feed.enabled)}
+                                                                                className={`px-2 py-1 text-xs rounded font-semibold transition-all ${feed.enabled ? 'bg-purple-600 hover:bg-purple-700' : (darkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-400 hover:bg-gray-500')} text-white`} title={feed.enabled ? 'Disable Schedule' : 'Enable Schedule'}>
+                                                                                <i className={`fas fa-clock`}></i>
+                                                                            </button>
+                                                                            <button onClick={() => { setEditingFeed(feed); setFeedTypeFilter(null); setShowAddFeedModal(true); }}
+                                                                                className={`px-2 py-1 text-xs rounded font-semibold ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass} transition-all`} title="Edit">
+                                                                                <i className="fas fa-edit"></i>
+                                                                            </button>
+                                                                            <button onClick={() => deleteFeed(feed.id)}
+                                                                                className="px-2 py-1 text-xs rounded font-semibold bg-red-600 hover:bg-red-700 text-white transition-all" title="Delete">
+                                                                                <i className="fas fa-trash"></i>
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    {/* Pagination Controls for List View */}
+                                                    {totalPages > 1 && (
+                                                        <div className="flex items-center justify-between mt-4 pt-3 border-t border-gray-700">
+                                                            <span className={`text-sm ${textSecondaryClass}`}>
+                                                                Showing {((feedPage - 1) * FEEDS_PER_PAGE) + 1}-{Math.min(feedPage * FEEDS_PER_PAGE, filteredFeeds.length)} of {filteredFeeds.length}
+                                                            </span>
+                                                            <div className="flex items-center space-x-2">
+                                                                <button
+                                                                    onClick={() => setFeedPage(p => Math.max(1, p - 1))}
+                                                                    disabled={feedPage === 1}
+                                                                    className={`px-3 py-1 text-sm rounded ${feedPage === 1 ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-700'} ${darkMode ? 'bg-gray-800' : 'bg-gray-200'} ${textClass}`}
+                                                                >
+                                                                    <i className="fas fa-chevron-left"></i>
+                                                                </button>
+                                                                <span className={`text-sm ${textClass}`}>Page {feedPage} of {totalPages}</span>
+                                                                <button
+                                                                    onClick={() => setFeedPage(p => Math.min(totalPages, p + 1))}
+                                                                    disabled={feedPage === totalPages}
+                                                                    className={`px-3 py-1 text-sm rounded ${feedPage === totalPages ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-700'} ${darkMode ? 'bg-gray-800' : 'bg-gray-200'} ${textClass}`}
+                                                                >
+                                                                    <i className="fas fa-chevron-right"></i>
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()
+                                                ) : (
+                                                    /* Tile View - Grid Layout */
+                                                    (() => {
+                                                        const filteredFeeds = marketplaceFeeds.filter(feed => {
+                                                            const provider = marketplaceProviders.find(p => p.id === feed.provider_id);
+                                                            if (feedSearchFilter) {
+                                                                const searchLower = feedSearchFilter.toLowerCase();
+                                                                const matchesSearch = feed.name.toLowerCase().includes(searchLower) ||
+                                                                                      (provider?.name || '').toLowerCase().includes(searchLower);
+                                                                if (!matchesSearch) return false;
+                                                            }
+                                                            if (feedCategoryFilter === 'all') return true;
+                                                            const catMatch = feedCategories[feedCategoryFilter]?.match;
+                                                            return catMatch ? catMatch.includes(provider?.category) : provider?.category === feedCategoryFilter;
+                                                        });
+                                                        const TILES_PER_PAGE = 10; // ~2 rows at 5 cols
+                                                        const totalPages = Math.ceil(filteredFeeds.length / TILES_PER_PAGE);
+                                                        const paginatedFeeds = filteredFeeds.slice((feedPage - 1) * TILES_PER_PAGE, feedPage * TILES_PER_PAGE);
+                                                        return (
+                                                            <div>
+                                                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+                                                        {paginatedFeeds.map(feed => {
+                                                            const provider = marketplaceProviders.find(p => p.id === feed.provider_id);
+                                                            const syncStatus = feedSyncStatus[feed.id];
+                                                            return (
+                                                                <div key={feed.id} className={`p-3 rounded-lg border-2 aspect-square flex flex-col shadow-md hover:shadow-lg transition-shadow ${darkMode ? 'bg-gray-800 border-gray-500' : 'bg-white border-gray-300'}`}>
+                                                                    <div className="flex-1 min-h-0 overflow-hidden">
+                                                                        <div className="flex items-center justify-between mb-1">
+                                                                            <span className={`font-semibold text-sm truncate ${textClass}`} title={feed.name}>{feed.name}</span>
+                                                                            {feed.enabled ? (
+                                                                                <span className="px-1.5 py-0.5 text-xs rounded bg-green-600 text-white flex-shrink-0 ml-1">Active</span>
+                                                                            ) : (
+                                                                                <span className={`px-1.5 py-0.5 text-xs rounded ${darkMode ? 'bg-gray-600' : 'bg-gray-300'} text-gray-200 flex-shrink-0 ml-1`}>Off</span>
+                                                                            )}
+                                                                        </div>
+                                                                        <p className={`text-xs ${textSecondaryClass} mb-2 truncate flex items-center`} title={provider?.name || feed.provider_id}>
+                                                                            <span className="truncate">{provider?.name || feed.provider_id}</span>
+                                                                            {provider?.auth_type && provider.auth_type !== 'none' && !feed.api_key && (
+                                                                                <span className="ml-1 px-1 py-0.5 text-[10px] bg-yellow-600 text-white rounded flex-shrink-0" title="Requires API Key">
+                                                                                    <i className="fas fa-key"></i>
+                                                                                </span>
+                                                                            )}
+                                                                        </p>
+                                                                        <div className={`text-xs ${textSecondaryClass} space-y-0.5`}>
+                                                                            <div className="truncate"><i className="fas fa-clock mr-1"></i>{(() => {
+                                                                                const cron = feed.schedule_cron || '0 6 * * *';
+                                                                                const parts = cron.split(' ');
+                                                                                if (parts.length < 5) return cron;
+                                                                                const minute = parts[0], hour = parts[1], dayOfWeek = parts[4];
+                                                                                const h = parseInt(hour), m = parseInt(minute);
+                                                                                const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+                                                                                const ampm = h < 12 ? 'AM' : 'PM';
+                                                                                const timeStr = `${hour12}:${String(m).padStart(2, '0')} ${ampm}`;
+                                                                                const dayNames = {0:'Su',1:'Mo',2:'Tu',3:'We',4:'Th',5:'Fr',6:'Sa'};
+                                                                                if (dayOfWeek === '*') return `Daily ${timeStr}`;
+                                                                                const days = dayOfWeek.split(',').map(d => dayNames[d] || d).join('');
+                                                                                return `${days} ${timeStr}`;
+                                                                            })()}</div>
+                                                                            <div className="truncate" title={feed.lookup_filename}><i className="fas fa-file mr-1"></i>{feed.lookup_filename}</div>
+                                                                            <div className="truncate"><i className="fas fa-server mr-1"></i>{feed.target_api_type}/{feed.target_worker_groups || feed.target_worker_group || 'default'}</div>
+                                                                            {feed.last_sync_status && (
+                                                                                <div className={`truncate ${feed.last_sync_status === 'success' ? 'text-green-500' : feed.last_sync_status === 'error' ? 'text-red-500' : ''}`}>
+                                                                                    <i className={`fas ${feed.last_sync_status === 'success' ? 'fa-check-circle' : feed.last_sync_status === 'error' ? 'fa-exclamation-circle' : 'fa-info-circle'} mr-1`}></i>
+                                                                                    {feed.last_sync_status}
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div className={`flex items-center justify-center space-x-1 mt-2 pt-2 border-t flex-shrink-0 ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
+                                                                        <button
+                                                                            onClick={() => syncFeed(feed.id, feed.name)}
+                                                                            disabled={syncStatus === 'syncing'}
+                                                                            className={`px-2 py-1 text-xs rounded font-semibold transition-all ${
+                                                                                syncStatus === 'syncing' ? 'bg-yellow-600 text-white' :
+                                                                                syncStatus === 'success' ? 'bg-green-600 text-white' :
+                                                                                syncStatus === 'error' ? 'bg-red-600 text-white' :
+                                                                                'bg-blue-600 hover:bg-blue-700 text-white'
+                                                                            }`}
+                                                                            title="Run Now"
+                                                                        >
+                                                                            <i className={`fas ${syncStatus === 'syncing' ? 'fa-circle-notch fa-spin' : 'fa-play'}`}></i>
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => toggleFeedEnabled(feed.id, !feed.enabled)}
+                                                                            className={`px-2 py-1 text-xs rounded font-semibold transition-all ${
+                                                                                feed.enabled
+                                                                                    ? 'bg-purple-600 hover:bg-purple-700'
+                                                                                    : (darkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-400 hover:bg-gray-500')
+                                                                            } text-white`}
+                                                                            title={feed.enabled ? 'Disable Schedule' : 'Enable Schedule'}
+                                                                        >
+                                                                            <i className={`fas fa-clock`}></i>
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => { setEditingFeed(feed); setFeedTypeFilter(null); setShowAddFeedModal(true); }}
+                                                                            className={`px-2 py-1 text-xs rounded font-semibold ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass} transition-all`}
+                                                                            title="Edit"
+                                                                        >
+                                                                            <i className="fas fa-edit"></i>
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => deleteFeed(feed.id)}
+                                                                            className="px-2 py-1 text-xs rounded font-semibold bg-red-600 hover:bg-red-700 text-white transition-all"
+                                                                            title="Delete"
+                                                                        >
+                                                                            <i className="fas fa-trash"></i>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    {/* Pagination Controls for Tile View */}
+                                                    {totalPages > 1 && (
+                                                        <div className="flex items-center justify-between mt-4 pt-3 border-t border-gray-700">
+                                                            <span className={`text-sm ${textSecondaryClass}`}>
+                                                                Showing {((feedPage - 1) * TILES_PER_PAGE) + 1}-{Math.min(feedPage * TILES_PER_PAGE, filteredFeeds.length)} of {filteredFeeds.length}
+                                                            </span>
+                                                            <div className="flex items-center space-x-2">
+                                                                <button
+                                                                    onClick={() => setFeedPage(p => Math.max(1, p - 1))}
+                                                                    disabled={feedPage === 1}
+                                                                    className={`px-3 py-1 text-sm rounded ${feedPage === 1 ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-700'} ${darkMode ? 'bg-gray-800' : 'bg-gray-200'} ${textClass}`}
+                                                                >
+                                                                    <i className="fas fa-chevron-left"></i>
+                                                                </button>
+                                                                <span className={`text-sm ${textClass}`}>Page {feedPage} of {totalPages}</span>
+                                                                <button
+                                                                    onClick={() => setFeedPage(p => Math.min(totalPages, p + 1))}
+                                                                    disabled={feedPage === totalPages}
+                                                                    className={`px-3 py-1 text-sm rounded ${feedPage === totalPages ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-700'} ${darkMode ? 'bg-gray-800' : 'bg-gray-200'} ${textClass}`}
+                                                                >
+                                                                    <i className="fas fa-chevron-right"></i>
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()
+                                                )}
+                                            </div>
+
+                                            {/* Feed Preview Panel */}
+                                            {feedPreview && (
+                                                <div className={`${cardClass} rounded-xl p-4 mt-4 overflow-hidden min-w-0`}>
+                                                    <div className="flex items-center justify-between mb-3">
+                                                        <h3 className={`font-bold ${textClass}`}>
+                                                            <i className="fas fa-table mr-2 text-blue-500"></i>
+                                                            Feed Preview: {feedPreview.feedName}
+                                                        </h3>
+                                                        <div className="flex items-center space-x-3">
+                                                            <span className={`text-xs ${textSecondaryClass}`}>
+                                                                Showing {feedPreview.rows?.length || 0} of {feedPreview.total_count || 0} records
+                                                            </span>
+                                                            <button
+                                                                onClick={() => setFeedPreview(null)}
+                                                                className={`${textSecondaryClass} hover:${textClass} text-sm`}
+                                                                title="Close preview"
+                                                            >
+                                                                <i className="fas fa-times"></i>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                    <div className="overflow-x-auto max-h-80 overflow-y-auto min-w-0 w-full">
+                                                        <table className="text-xs table-auto">
+                                                            <thead className={`${darkMode ? 'bg-gray-700' : 'bg-gray-100'} sticky top-0`}>
+                                                                <tr>
+                                                                    {(feedPreview.headers || []).map((header, idx) => (
+                                                                        <th key={idx} className={`px-2 py-1.5 text-left font-semibold ${textClass} whitespace-nowrap`}>
+                                                                            {header}
+                                                                        </th>
+                                                                    ))}
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody className={`divide-y ${darkMode ? 'divide-gray-700' : 'divide-gray-200'}`}>
+                                                                {(feedPreview.rows || []).map((row, rowIdx) => (
+                                                                    <tr key={rowIdx} className={`${darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-50'}`}>
+                                                                        {row.map((cell, cellIdx) => (
+                                                                            <td key={cellIdx} className={`px-2 py-1 ${textSecondaryClass} whitespace-nowrap max-w-xs truncate`} title={cell}>
+                                                                                {cell}
+                                                                            </td>
+                                                                        ))}
+                                                                    </tr>
+                                                                ))}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Marketplace curl Commands Panel */}
+                                            <div className={`${cardClass} rounded-xl p-4 mt-4`}>
+                                                <div className={`flex items-center justify-between ${marketplaceCurlMinimized ? '' : 'pb-2 mb-2 border-b'} ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center flex-1 cursor-pointer" onClick={() => setMarketplaceCurlMinimized(!marketplaceCurlMinimized)}>
+                                                        <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-gray-700' : 'bg-gray-200'} mr-2`}>
+                                                            <i className={`fas fa-code text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}></i>
+                                                        </div>
+                                                        <h3 className={`text-base font-bold ${textClass}`}>curl Commands</h3>
+                                                    </div>
+                                                    <div className="flex items-center space-x-2">
+                                                        <button
+                                                            onClick={() => setMarketplaceCurlMinimized(!marketplaceCurlMinimized)}
+                                                            className={`p-1.5 rounded-lg ${darkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-200 text-gray-500'} transition-all`}
+                                                            title={marketplaceCurlMinimized ? "Expand" : "Minimize"}
+                                                        >
+                                                            <i className={`fas fa-chevron-${marketplaceCurlMinimized ? 'down' : 'up'}`}></i>
+                                                        </button>
+                                                        {!marketplaceCurlMinimized && (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => setMarketplaceShowSensitive(!marketplaceShowSensitive)}
+                                                                    className="px-2 py-1 text-xs rounded-lg font-semibold bg-gray-700 hover:bg-gray-600 text-white transition-all"
+                                                                    title={marketplaceShowSensitive ? "Hide sensitive data" : "Show sensitive data"}
+                                                                >
+                                                                    <i className={`fas ${marketplaceShowSensitive ? 'fa-eye-slash' : 'fa-eye'} mr-1`}></i>
+                                                                    {marketplaceShowSensitive ? 'Hide' : 'Show'}
+                                                                </button>
+                                                                {marketplaceCurlHistory.length > 0 && (
+                                                                    <button
+                                                                        onClick={() => setMarketplaceCurlHistory([])}
+                                                                        className={`px-2 py-1 text-xs rounded-lg font-semibold ${darkMode ? 'bg-orange-700 hover:bg-orange-600' : 'bg-orange-500 hover:bg-orange-600'} text-white transition-all`}
+                                                                    >
+                                                                        <i className="fas fa-eraser mr-1"></i>Clear
+                                                                    </button>
+                                                                )}
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {!marketplaceCurlMinimized && (
+                                                    <div className={`${darkMode ? 'bg-black' : 'bg-gray-900'} rounded-lg p-3 font-mono text-[10px] max-h-64 overflow-y-auto flex flex-col-reverse`}>
+                                                        {marketplaceCurlHistory.length === 0 ? (
+                                                            <div className="text-gray-400 text-center py-6">
+                                                                <i className="fas fa-terminal text-2xl mb-2 block"></i>
+                                                                <p>No API commands yet. Commands will appear here as you sync feeds.</p>
+                                                            </div>
+                                                        ) : (
+                                                            <div className="space-y-3">
+                                                                {marketplaceCurlHistory.map((cmd) => (
+                                                                    <div key={cmd.id} className={`p-3 rounded-lg ${darkMode ? 'bg-gray-900' : 'bg-black'} border ${darkMode ? 'border-gray-700' : 'border-gray-600'}`}>
+                                                                        <div className="flex items-start justify-between mb-2">
+                                                                            <div className="flex-1">
+                                                                                <div className="flex items-center space-x-2 mb-1">
+                                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${cmd.method === 'GET' ? 'bg-blue-600' : cmd.method === 'POST' ? 'bg-green-600' : cmd.method === 'DELETE' ? 'bg-red-600' : cmd.method === 'PATCH' ? 'bg-purple-600' : 'bg-orange-600'} text-white`}>
+                                                                                        {cmd.method}
+                                                                                    </span>
+                                                                                    <span className="text-gray-400 text-[10px]">{cmd.timestamp}</span>
+                                                                                </div>
+                                                                                <p className="text-green-400 text-[10px]">{cmd.description}</p>
+                                                                            </div>
+                                                                            <div className="flex items-center space-x-1 ml-2 flex-shrink-0">
+                                                                                <button
+                                                                                    onClick={() => testMarketplaceApiCall(`marketplace_${cmd.id}`, cmd.url)}
+                                                                                    disabled={!sessionInfo.token || marketplaceTestingCommand === `marketplace_${cmd.id}`}
+                                                                                    className={`px-2 py-1 rounded text-xs ${darkMode ? 'bg-blue-700 hover:bg-blue-600' : 'bg-blue-500 hover:bg-blue-600'} text-white transition-all disabled:opacity-50`}
+                                                                                    title="Test"
+                                                                                >
+                                                                                    <i className={marketplaceTestingCommand === `marketplace_${cmd.id}` ? "fas fa-circle-notch fa-spin" : "fas fa-play"}></i>
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        navigator.clipboard.writeText(`curl -X ${cmd.method} "${cmd.url}" \\\n  -H "Authorization: Bearer ${sessionInfo.token || 'YOUR_TOKEN'}"`);
+                                                                                        showMessage('Copied!', 'success');
+                                                                                    }}
+                                                                                    className="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white transition-all"
+                                                                                    title="Copy"
+                                                                                >
+                                                                                    <i className="fas fa-copy"></i>
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => setMarketplaceCurlHistory(prev => prev.filter(c => c.id !== cmd.id))}
+                                                                                    className="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 text-white transition-all"
+                                                                                    title="Remove"
+                                                                                >
+                                                                                    <i className="fas fa-times"></i>
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="text-gray-300 text-[10px] whitespace-pre-wrap break-all font-mono">
+                                                                            {`curl -X ${cmd.method} "${cmd.url}" \\
+  -H "Authorization: Bearer ${marketplaceShowSensitive ? (sessionInfo.token || 'YOUR_TOKEN') : (sessionInfo.token ? maskToken(sessionInfo.token) : 'YOUR_TOKEN')}"`}
+                                                                        </div>
+                                                                        {marketplaceTestResults[`marketplace_${cmd.id}`] && (
+                                                                            <div className={`mt-2 p-2 rounded ${darkMode ? 'bg-black' : 'bg-gray-800'} border ${marketplaceTestResults[`marketplace_${cmd.id}`].status === 'error' ? 'border-red-500' : marketplaceTestResults[`marketplace_${cmd.id}`].status === 200 ? 'border-green-500' : 'border-yellow-500'}`}>
+                                                                                <div className="flex items-center justify-between mb-1">
+                                                                                    <span className={`text-[10px] font-bold ${marketplaceTestResults[`marketplace_${cmd.id}`].status === 'error' ? 'text-red-400' : marketplaceTestResults[`marketplace_${cmd.id}`].status === 200 ? 'text-green-400' : 'text-yellow-400'}`}>
+                                                                                        {marketplaceTestResults[`marketplace_${cmd.id}`].status === 'error' ? 'Error' : `${marketplaceTestResults[`marketplace_${cmd.id}`].status} ${marketplaceTestResults[`marketplace_${cmd.id}`].statusText}`}
+                                                                                    </span>
+                                                                                    <button
+                                                                                        onClick={() => setMarketplaceTestResults(prev => {
+                                                                                            const newResults = {...prev};
+                                                                                            delete newResults[`marketplace_${cmd.id}`];
+                                                                                            return newResults;
+                                                                                        })}
+                                                                                        className="text-gray-500 hover:text-gray-400 text-[10px]"
+                                                                                        title="Clear result"
+                                                                                    >
+                                                                                        <i className="fas fa-times"></i>
+                                                                                    </button>
+                                                                                </div>
+                                                                                <pre className="text-gray-300 text-[9px] overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">
+                                                                                    {JSON.stringify(marketplaceTestResults[`marketplace_${cmd.id}`].data || marketplaceTestResults[`marketplace_${cmd.id}`].error, null, 2)}
+                                                                                </pre>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Marketplace Console Panel */}
+                                            <div className={`${cardClass} rounded-xl p-4 mt-4`}>
+                                                <div className={`flex items-center justify-between ${!marketplaceConsoleMinimized ? `pb-2 mb-2 border-b ${darkMode ? 'border-gray-700' : 'border-gray-300'}` : ''}`}>
+                                                    <div className="flex items-center space-x-2 cursor-pointer" onClick={() => setMarketplaceConsoleMinimized(!marketplaceConsoleMinimized)}>
+                                                        <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+                                                            <i className={`fas fa-terminal text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}></i>
+                                                        </div>
+                                                        <h3 className={`text-base font-bold ${textClass}`}>Console</h3>
+                                                        {marketplaceConsoleLogs.length > 0 && (
+                                                            <span className={`text-xs px-2 py-0.5 rounded-full ${darkMode ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600'}`}>
+                                                                {marketplaceConsoleLogs.length}
+                                                            </span>
+                                                        )}
+                                                        <i className={`fas fa-chevron-${marketplaceConsoleMinimized ? 'down' : 'up'} text-xs ${textSecondaryClass}`}></i>
+                                                    </div>
+                                                    <div className="flex items-center space-x-2">
+                                                        {!marketplaceConsoleMinimized && marketplaceConsoleLogs.length > 0 && (
+                                                            <button onClick={() => setMarketplaceConsoleLogs([])} className={`text-xs ${textSecondaryClass} hover:text-red-400`}>
+                                                                <i className="fas fa-trash mr-1"></i>Clear
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                {!marketplaceConsoleMinimized && (
+                                                    <div className={`${darkMode ? 'bg-black' : 'bg-gray-900'} rounded-lg p-2 max-h-32 overflow-y-auto font-mono text-xs flex flex-col-reverse`}>
+                                                        {marketplaceConsoleLogs.length === 0 ? (
+                                                            <span className="text-gray-500">No activity yet...</span>
+                                                        ) : (
+                                                            <div>
+                                                                {marketplaceConsoleLogs.map((log, i) => (
+                                                                    <div key={i} className={log.type === 'error' ? 'text-red-400' : log.type === 'success' ? 'text-green-400' : log.type === 'warning' ? 'text-yellow-400' : 'text-gray-400'}>
+                                                                        <span className="text-gray-500">[{log.timestamp}]</span> {log.message}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Feed Type Selector Modal */}
+                                            {showFeedTypeSelector && (
+                                                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                                                    <div className={`${cardClass} rounded-xl p-6 max-w-md w-full mx-4`}>
+                                                        <div className="flex items-center justify-between mb-4">
+                                                            <h3 className={`text-lg font-bold ${textClass}`}>Choose Feed Type</h3>
+                                                            <button onClick={() => setShowFeedTypeSelector(false)} className={`${textSecondaryClass} hover:${textClass}`}>
+                                                                <i className="fas fa-times"></i>
+                                                            </button>
+                                                        </div>
+                                                        <p className={`text-sm ${textSecondaryClass} mb-4`}>Select the type of threat intelligence feed you want to add:</p>
+                                                        <div className="space-y-3">
+                                                            {/* Free Feeds Option */}
+                                                            <button
+                                                                onClick={() => {
+                                                                    setFeedTypeFilter('free');
+                                                                    setShowFeedTypeSelector(false);
+                                                                    setShowAddFeedModal(true);
+                                                                    setFeedFormProviderId('');
+                                                                }}
+                                                                className={`w-full p-4 rounded-lg border-2 text-left transition-all ${darkMode ? 'border-green-600 bg-green-900/20 hover:bg-green-900/40' : 'border-green-500 bg-green-50 hover:bg-green-100'}`}
+                                                            >
+                                                                <div className="flex items-center space-x-3">
+                                                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center ${darkMode ? 'bg-green-600' : 'bg-green-500'}`}>
+                                                                        <i className="fas fa-gift text-white"></i>
+                                                                    </div>
+                                                                    <div className="flex-1">
+                                                                        <div className={`font-semibold ${textClass}`}>Free Feeds</div>
+                                                                        <div className={`text-sm ${textSecondaryClass}`}>
+                                                                            No authentication required - open source threat intelligence
+                                                                        </div>
+                                                                        <div className="mt-1">
+                                                                            <span className={`text-xs px-2 py-0.5 rounded-full ${darkMode ? 'bg-green-800 text-green-200' : 'bg-green-100 text-green-700'}`}>
+                                                                                {marketplaceProviders.filter(p => !p.auth_type || p.auth_type === 'none').length} providers available
+                                                                            </span>
+                                                                        </div>
+                                                                    </div>
+                                                                    <i className={`fas fa-chevron-right ${textSecondaryClass}`}></i>
+                                                                </div>
+                                                            </button>
+
+                                                            {/* Auth Required Feeds Option */}
+                                                            <button
+                                                                onClick={() => {
+                                                                    setFeedTypeFilter('auth');
+                                                                    setShowFeedTypeSelector(false);
+                                                                    setShowAddFeedModal(true);
+                                                                    setFeedFormProviderId('');
+                                                                }}
+                                                                className={`w-full p-4 rounded-lg border-2 text-left transition-all ${darkMode ? 'border-purple-600 bg-purple-900/20 hover:bg-purple-900/40' : 'border-purple-500 bg-purple-50 hover:bg-purple-100'}`}
+                                                            >
+                                                                <div className="flex items-center space-x-3">
+                                                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center ${darkMode ? 'bg-purple-600' : 'bg-purple-500'}`}>
+                                                                        <i className="fas fa-key text-white"></i>
+                                                                    </div>
+                                                                    <div className="flex-1">
+                                                                        <div className={`font-semibold ${textClass}`}>Authentication Required</div>
+                                                                        <div className={`text-sm ${textSecondaryClass}`}>
+                                                                            Premium feeds requiring API keys or credentials
+                                                                        </div>
+                                                                        <div className="mt-1">
+                                                                            <span className={`text-xs px-2 py-0.5 rounded-full ${darkMode ? 'bg-purple-800 text-purple-200' : 'bg-purple-100 text-purple-700'}`}>
+                                                                                {marketplaceProviders.filter(p => p.auth_type && p.auth_type !== 'none').length} providers available
+                                                                            </span>
+                                                                        </div>
+                                                                    </div>
+                                                                    <i className={`fas fa-chevron-right ${textSecondaryClass}`}></i>
+                                                                </div>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Add/Edit Feed Modal */}
+                                            {showAddFeedModal && (
+                                                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                                                    <div className={`${cardClass} rounded-xl p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto`}>
+                                                        <div className="flex items-center justify-between mb-4">
+                                                            <div className="flex items-center space-x-2">
+                                                                <h3 className={`text-lg font-bold ${textClass}`}>{editingFeed ? 'Edit Feed' : 'Add Feed'}</h3>
+                                                                {!editingFeed && feedTypeFilter && (
+                                                                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                                                                        feedTypeFilter === 'free'
+                                                                            ? (darkMode ? 'bg-green-800 text-green-200' : 'bg-green-100 text-green-700')
+                                                                            : (darkMode ? 'bg-purple-800 text-purple-200' : 'bg-purple-100 text-purple-700')
+                                                                    }`}>
+                                                                        {feedTypeFilter === 'free' ? 'Free Feed' : 'Auth Required'}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <button onClick={() => { setShowAddFeedModal(false); setEditingFeed(null); setFeedTypeFilter(null); }} className={`${textSecondaryClass} hover:${textClass}`}>
+                                                                <i className="fas fa-times"></i>
+                                                            </button>
+                                                        </div>
+                                                        <form onSubmit={async (e) => {
+                                                            e.preventDefault();
+                                                            const formData = new FormData(e.target);
+                                                            // Build cron expression from form data
+                                                            const scheduleMode = formData.get('schedule_mode');
+                                                            let schedule_cron;
+                                                            if (scheduleMode === 'cron') {
+                                                                schedule_cron = formData.get('schedule_cron_raw') || '0 6 * * *';
+                                                            } else {
+                                                                // Easy mode: build cron from days and time
+                                                                const selectedDays = [];
+                                                                ['0','1','2','3','4','5','6'].forEach(d => {
+                                                                    if (formData.get(`day_${d}`) === 'on') selectedDays.push(d);
+                                                                });
+                                                                const hour = formData.get('schedule_hour') || '6';
+                                                                const minute = formData.get('schedule_minute') || '0';
+                                                                const dayOfWeek = selectedDays.length === 7 || selectedDays.length === 0 ? '*' : selectedDays.join(',');
+                                                                schedule_cron = `${minute} ${hour} * * ${dayOfWeek}`;
+                                                            }
+                                                            // Build target_worker_groups from multi-select Set
+                                                            const targetApiType = formData.get('target_api_type');
+                                                            let targetWorkerGroups = [];
+                                                            if (targetApiType === 'search') {
+                                                                targetWorkerGroups = ['default_search'];
+                                                            } else {
+                                                                targetWorkerGroups = Array.from(selectedFeedTargetGroups);
+                                                            }
+                                                            const feedData = {
+                                                                name: formData.get('name'),
+                                                                provider_id: formData.get('provider_id'),
+                                                                lookup_filename: formData.get('lookup_filename'),
+                                                                target_api_type: targetApiType,
+                                                                target_worker_groups: JSON.stringify(targetWorkerGroups),
+                                                                schedule_cron: schedule_cron,
+                                                                auto_deploy: formData.get('auto_deploy') === 'on',
+                                                                enabled: formData.get('enabled') === 'on',
+                                                                auth_config: {}
+                                                            };
+                                                            const provider = marketplaceProviders.find(p => p.id === feedData.provider_id);
+                                                            if (provider?.auth_type === 'api_key_header') {
+                                                                feedData.auth_config = { api_key: formData.get('api_key') };
+                                                            } else if (provider?.auth_type === 'basic_auth') {
+                                                                feedData.auth_config = { username: formData.get('username'), password: formData.get('password') };
+                                                            }
+                                                            const success = editingFeed ? await updateFeed(editingFeed.id, feedData) : await createFeed(feedData);
+                                                            if (success) { setShowAddFeedModal(false); setEditingFeed(null); }
+                                                        }} className="space-y-4">
+                                                            <div>
+                                                                <label className={`block text-sm font-medium ${textClass} mb-1`}>Feed Name</label>
+                                                                <input name="name" defaultValue={editingFeed?.name || ''} required className={`w-full px-3 py-2 rounded-lg border ${inputClass}`} placeholder="e.g., Spamhaus DROP" />
+                                                            </div>
+                                                            <div>
+                                                                <label className={`block text-sm font-medium ${textClass} mb-1`}>Provider</label>
+                                                                <select
+                                                                    name="provider_id"
+                                                                    value={feedFormProviderId}
+                                                                    onChange={(e) => setFeedFormProviderId(e.target.value)}
+                                                                    required
+                                                                    className={`w-full px-3 py-2 rounded-lg border ${inputClass}`}
+                                                                >
+                                                                    <option value="">Select a provider...</option>
+                                                                    {(() => {
+                                                                        // Filter providers based on feed type selection
+                                                                        let filteredProviders = marketplaceProviders;
+                                                                        if (feedTypeFilter === 'free') {
+                                                                            filteredProviders = marketplaceProviders.filter(p => !p.auth_type || p.auth_type === 'none');
+                                                                        } else if (feedTypeFilter === 'auth') {
+                                                                            filteredProviders = marketplaceProviders.filter(p => p.auth_type && p.auth_type !== 'none');
+                                                                        }
+                                                                        // Group providers by category
+                                                                        const categoryLabels = {
+                                                                            'ip_blocklist': 'IP Blocklists',
+                                                                            'botnet_c2': 'Botnet C2 Servers',
+                                                                            'malware_urls': 'Malware URLs',
+                                                                            'malware_domains': 'Malware Domains',
+                                                                            'malware_hashes': 'Malware Hashes/IOCs',
+                                                                            'threat_intel': 'Threat Intelligence',
+                                                                            'phishing': 'Phishing',
+                                                                            'tor_proxy': 'Tor/Anonymizers/Proxies',
+                                                                            'domain_rankings': 'Domain Rankings/Allowlists',
+                                                                            'cloud_ips': 'Cloud Provider IPs',
+                                                                            'geolocation': 'Geolocation/GeoIP',
+                                                                            'ip_context': 'IP Context/Enrichment',
+                                                                            'reference': 'Reference Data',
+                                                                            'ad_tracking': 'Ad/Tracking Blocklists',
+                                                                            'vulnerability': 'Vulnerabilities/CVE',
+                                                                            'other': 'Other'
+                                                                        };
+                                                                        const grouped = {};
+                                                                        filteredProviders.forEach(p => {
+                                                                            const cat = p.category || 'other';
+                                                                            if (!grouped[cat]) grouped[cat] = [];
+                                                                            grouped[cat].push(p);
+                                                                        });
+                                                                        // Sort categories by label order
+                                                                        const categoryOrder = Object.keys(categoryLabels);
+                                                                        return categoryOrder.filter(cat => grouped[cat]?.length > 0).map(cat => (
+                                                                            <optgroup key={cat} label={categoryLabels[cat] || cat}>
+                                                                                {grouped[cat].map(p => (
+                                                                                    <option key={p.id} value={p.id}>{p.name}</option>
+                                                                                ))}
+                                                                            </optgroup>
+                                                                        ));
+                                                                    })()}
+                                                                </select>
+                                                                {/* Provider description */}
+                                                                {feedFormProviderId && (() => {
+                                                                    const selectedProvider = marketplaceProviders.find(p => p.id === feedFormProviderId);
+                                                                    return selectedProvider?.description ? (
+                                                                        <p className={`text-xs ${textSecondaryClass} mt-1 italic`}>
+                                                                            <i className="fas fa-info-circle mr-1"></i>
+                                                                            {selectedProvider.description}
+                                                                        </p>
+                                                                    ) : null;
+                                                                })()}
+                                                            </div>
+                                                            <div>
+                                                                <label className={`block text-sm font-medium ${textClass} mb-1`}>Lookup Filename</label>
+                                                                <input name="lookup_filename" defaultValue={editingFeed?.lookup_filename || ''} required className={`w-full px-3 py-2 rounded-lg border ${inputClass}`} placeholder="e.g., spamhaus_drop.csv" />
+                                                            </div>
+                                                            <div className={`grid gap-4 ${feedFormApiType === 'search' ? 'grid-cols-1' : 'grid-cols-2'}`}>
+                                                                <div>
+                                                                    <label className={`block text-sm font-medium ${textClass} mb-1`}>Target Product</label>
+                                                                    <select
+                                                                        name="target_api_type"
+                                                                        value={feedFormApiType}
+                                                                        onChange={(e) => {
+                                                                            setFeedFormApiType(e.target.value);
+                                                                            setSelectedFeedTargetGroups(new Set()); // Clear selection when product changes
+                                                                        }}
+                                                                        className={`w-full px-3 py-2 rounded-lg border ${inputClass}`}
+                                                                    >
+                                                                        <option value="stream">Stream</option>
+                                                                        <option value="edge">Edge</option>
+                                                                        <option value="search">Search</option>
+                                                                    </select>
+                                                                </div>
+                                                                {feedFormApiType !== 'search' && (
+                                                                    <div>
+                                                                        <label className={`block text-sm font-medium ${textClass} mb-1`}>
+                                                                            {feedFormApiType === 'edge' ? 'Fleet(s)' : 'Worker Group(s)'}
+                                                                        </label>
+                                                                        <div className={`border rounded-lg ${darkMode ? 'border-gray-700' : 'border-gray-300'} max-h-32 overflow-y-auto`}>
+                                                                            {feedFormWorkerGroups.length === 0 ? (
+                                                                                <div className={`text-center py-3 ${textSecondaryClass} text-xs`}>
+                                                                                    Loading...
+                                                                                </div>
+                                                                            ) : (
+                                                                                feedFormWorkerGroups.map(wg => {
+                                                                                    const wgId = typeof wg === 'object' ? wg.id : wg;
+                                                                                    const wgName = typeof wg === 'object' ? wg.name : wg;
+                                                                                    return (
+                                                                                        <div
+                                                                                            key={wgId}
+                                                                                            className={`flex items-center px-3 py-2 text-sm ${selectedFeedTargetGroups.has(wgId) ? (darkMode ? 'bg-purple-900 bg-opacity-30' : 'bg-purple-50') : ''} hover:${darkMode ? 'bg-gray-700' : 'bg-gray-100'} cursor-pointer`}
+                                                                                            onClick={() => {
+                                                                                                const newSelected = new Set(selectedFeedTargetGroups);
+                                                                                                if (newSelected.has(wgId)) {
+                                                                                                    newSelected.delete(wgId);
+                                                                                                } else {
+                                                                                                    newSelected.add(wgId);
+                                                                                                }
+                                                                                                setSelectedFeedTargetGroups(newSelected);
+                                                                                            }}
+                                                                                        >
+                                                                                            <input
+                                                                                                type="checkbox"
+                                                                                                checked={selectedFeedTargetGroups.has(wgId)}
+                                                                                                onChange={() => {}}
+                                                                                                className="mr-2 rounded"
+                                                                                            />
+                                                                                            <span className={`flex-1 truncate ${textClass}`}>{wgName}</span>
+                                                                                        </div>
+                                                                                    );
+                                                                                })
+                                                                            )}
+                                                                        </div>
+                                                                        {selectedFeedTargetGroups.size > 0 && (
+                                                                            <p className={`text-xs ${darkMode ? 'text-purple-400' : 'text-purple-600'} mt-1`}>
+                                                                                <i className="fas fa-check-circle mr-1"></i>{selectedFeedTargetGroups.size} selected
+                                                                            </p>
+                                                                        )}
+                                                                    </div>
+                                                                )}
+                                                                {feedFormApiType === 'search' && (
+                                                                    <p className={`text-xs ${textSecondaryClass} mt-2`}>Search lookups go to global Search namespace</p>
+                                                                )}
+                                                            </div>
+                                                            {/* Schedule Configuration */}
+                                                            <div className={`p-3 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                <div className="flex items-center justify-between mb-3">
+                                                                    <label className={`block text-sm font-medium ${textClass}`}>Schedule</label>
+                                                                    <div className={`px-2 py-1 rounded text-xs font-mono ${darkMode ? 'bg-gray-900 text-green-400' : 'bg-white text-green-600'} border ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                                        <i className="fas fa-clock mr-1"></i>
+                                                                        {feedFormCronPreview}
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* Day checkboxes */}
+                                                                <div className="mb-3">
+                                                                    <p className={`text-xs ${textSecondaryClass} mb-2`}>Days of Week</p>
+                                                                    <div className="flex flex-wrap gap-1">
+                                                                        {[
+                                                                            {v: '0', l: 'Sun'}, {v: '1', l: 'Mon'}, {v: '2', l: 'Tue'},
+                                                                            {v: '3', l: 'Wed'}, {v: '4', l: 'Thu'}, {v: '5', l: 'Fri'}, {v: '6', l: 'Sat'}
+                                                                        ].map(day => (
+                                                                            <button
+                                                                                key={day.v}
+                                                                                type="button"
+                                                                                onClick={() => {
+                                                                                    if (feedFormScheduleDays.includes(day.v)) {
+                                                                                        setFeedFormScheduleDays(feedFormScheduleDays.filter(d => d !== day.v));
+                                                                                    } else {
+                                                                                        setFeedFormScheduleDays([...feedFormScheduleDays, day.v].sort());
+                                                                                    }
+                                                                                }}
+                                                                                className={`flex items-center justify-center w-10 h-8 rounded text-xs font-medium transition-all border
+                                                                                    ${feedFormScheduleDays.includes(day.v)
+                                                                                        ? 'bg-purple-600 text-white border-purple-600'
+                                                                                        : (darkMode ? 'bg-gray-700 hover:bg-gray-600 border-gray-600' : 'bg-white hover:bg-gray-200 border-gray-300')
+                                                                                    } ${!feedFormScheduleDays.includes(day.v) ? textSecondaryClass : ''}`}
+                                                                            >
+                                                                                {day.l}
+                                                                            </button>
+                                                                        ))}
+                                                                    </div>
+                                                                    {/* Hidden inputs for form submission */}
+                                                                    {feedFormScheduleDays.map(d => (
+                                                                        <input key={d} type="hidden" name={`day_${d}`} value="on" />
+                                                                    ))}
+                                                                </div>
+
+                                                                {/* Time selection */}
+                                                                <div className="grid grid-cols-2 gap-2">
+                                                                    <div>
+                                                                        <p className={`text-xs ${textSecondaryClass} mb-1`}>Hour</p>
+                                                                        <select
+                                                                            name="schedule_hour"
+                                                                            value={feedFormScheduleHour}
+                                                                            onChange={(e) => setFeedFormScheduleHour(e.target.value)}
+                                                                            className={`w-full px-2 py-1.5 rounded border text-sm ${inputClass}`}
+                                                                        >
+                                                                            {[...Array(24)].map((_, h) => {
+                                                                                const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+                                                                                const ampm = h < 12 ? 'AM' : 'PM';
+                                                                                return <option key={h} value={h}>{hour12} {ampm}</option>;
+                                                                            })}
+                                                                        </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <p className={`text-xs ${textSecondaryClass} mb-1`}>Minute</p>
+                                                                        <select
+                                                                            name="schedule_minute"
+                                                                            value={feedFormScheduleMinute}
+                                                                            onChange={(e) => setFeedFormScheduleMinute(e.target.value)}
+                                                                            className={`w-full px-2 py-1.5 rounded border text-sm ${inputClass}`}
+                                                                        >
+                                                                            {[...Array(60)].map((_, m) => (
+                                                                                <option key={m} value={m}>{String(m).padStart(2, '0')}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* Preview text */}
+                                                                <p className={`text-xs ${textSecondaryClass} mt-2`}>
+                                                                    {(() => {
+                                                                        const h = parseInt(feedFormScheduleHour);
+                                                                        const m = parseInt(feedFormScheduleMinute);
+                                                                        const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+                                                                        const ampm = h < 12 ? 'AM' : 'PM';
+                                                                        const timeStr = `${hour12}:${String(m).padStart(2, '0')} ${ampm}`;
+                                                                        const dayNames = {0:'Sun',1:'Mon',2:'Tue',3:'Wed',4:'Thu',5:'Fri',6:'Sat'};
+                                                                        if (feedFormScheduleDays.length === 7 || feedFormScheduleDays.length === 0) return `Runs daily at ${timeStr}`;
+                                                                        const days = feedFormScheduleDays.map(d => dayNames[d]).join(', ');
+                                                                        return `Runs on ${days} at ${timeStr}`;
+                                                                    })()}
+                                                                </p>
+                                                            </div>
+                                                            <div className="flex items-center space-x-4">
+                                                                <label className="flex items-center space-x-2">
+                                                                    <input name="auto_deploy" type="checkbox" defaultChecked={editingFeed?.auto_deploy ?? true} className="rounded" />
+                                                                    <span className={`text-sm ${textClass}`}>Auto-deploy after sync</span>
+                                                                </label>
+                                                                <label className="flex items-center space-x-2">
+                                                                    <input name="enabled" type="checkbox" defaultChecked={editingFeed?.enabled ?? true} className="rounded" />
+                                                                    <span className={`text-sm ${textClass}`}>Schedule Enabled</span>
+                                                                </label>
+                                                            </div>
+                                                            {/* Only show authentication section for providers that require it */}
+                                                            {(() => {
+                                                                const selectedProvider = marketplaceProviders.find(p => p.id === feedFormProviderId);
+                                                                const needsAuth = selectedProvider && selectedProvider.auth_type && selectedProvider.auth_type !== 'none';
+                                                                if (!needsAuth) return null;
+                                                                return (
+                                                                    <div className={`p-3 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                        <p className={`text-xs ${textSecondaryClass} mb-2`}>
+                                                                            <i className="fas fa-key mr-1"></i>
+                                                                            Authentication Required
+                                                                        </p>
+                                                                        <div className="space-y-2">
+                                                                            {selectedProvider.auth_type === 'api_key_header' && (
+                                                                                <input name="api_key" type="password" defaultValue={editingFeed?.auth_config?.api_key || ''} className={`w-full px-3 py-2 rounded-lg border ${inputClass} text-sm`} placeholder="API Key" />
+                                                                            )}
+                                                                            {selectedProvider.auth_type === 'basic_auth' && (
+                                                                                <div className="grid grid-cols-2 gap-2">
+                                                                                    <input name="username" defaultValue={editingFeed?.auth_config?.username || ''} className={`px-3 py-2 rounded-lg border ${inputClass} text-sm`} placeholder="Username / Account ID" />
+                                                                                    <input name="password" type="password" defaultValue={editingFeed?.auth_config?.password || ''} className={`px-3 py-2 rounded-lg border ${inputClass} text-sm`} placeholder="License Key" />
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })()}
+                                                            <div className="flex justify-end space-x-3 pt-2">
+                                                                <button type="button" onClick={() => { setShowAddFeedModal(false); setEditingFeed(null); }} className={`px-4 py-2 rounded-lg ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass} font-semibold transition-all`}>
+                                                                    Cancel
+                                                                </button>
+                                                                {editingFeed && (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => syncFeed(editingFeed.id, editingFeed.name)}
+                                                                        disabled={feedSyncStatus[editingFeed.id] === 'syncing'}
+                                                                        className={`px-4 py-2 rounded-lg ${feedSyncStatus[editingFeed.id] === 'syncing' ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'} text-white font-semibold transition-all flex items-center space-x-2`}
+                                                                    >
+                                                                        <i className={`fas ${feedSyncStatus[editingFeed.id] === 'syncing' ? 'fa-spinner fa-spin' : 'fa-play'}`}></i>
+                                                                        <span>{feedSyncStatus[editingFeed.id] === 'syncing' ? 'Testing...' : 'Test Feed'}</span>
+                                                                    </button>
+                                                                )}
+                                                                <button type="submit" className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-semibold transition-all">
+                                                                    {editingFeed ? 'Update' : 'Create'} Feed
+                                                                </button>
+                                                            </div>
+                                                        </form>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
                                     ) : (
                                         /* Knowledge Items Interface */
                                         (() => {

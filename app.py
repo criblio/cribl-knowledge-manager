@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Cribl Knowledge Manager - Backend Server
-Version: 0.1.0
-Date: December 4, 2025
+Version: 4.0.0
+Date: December 2025
 
 This Flask application serves as a backend proxy for the Cribl Cloud API,
 enabling users to manage Knowledge items across Cribl Cloud deployments
@@ -51,6 +51,10 @@ API Endpoints:
 # When False, only essential startup/error messages are printed
 DEBUG_MODE = False
 
+# Commit message prefix to identify commits made by Knowledge Manager
+# Used to track undeployed commits made by this tool
+COMMIT_PREFIX = "[KnowledgeManager]"
+
 # =============================================================================
 # IMPORTS - Standard Library
 # =============================================================================
@@ -95,7 +99,8 @@ def check_install_package(package_name, import_name=None):
 required_packages = [
     ('Flask', 'flask'),
     ('Flask-CORS', 'flask_cors'),
-    ('requests', 'requests')
+    ('requests', 'requests'),
+    ('APScheduler', 'apscheduler')
 ]
 
 print("[INFO] Checking dependencies...")
@@ -127,6 +132,14 @@ import tempfile
 from datetime import datetime
 import re
 import logging
+import sqlite3
+import hashlib
+import csv
+from io import StringIO
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+import atexit
 
 # =============================================================================
 # LOGGING UTILITIES
@@ -242,6 +255,1699 @@ app_config = {
     'base_url': None,  # Store the base URL for API calls
     'is_direct_tenant': False  # Flag for direct tenant URLs
 }
+
+# =============================================================================
+# MARKETPLACE - Threat Intelligence Feed System
+# =============================================================================
+
+# Database path for feed configurations
+MARKETPLACE_DB_PATH = Path('marketplace.db')
+
+# Global scheduler instance
+scheduler = BackgroundScheduler()
+
+# Available feed providers with their configurations
+FEED_PROVIDERS = {
+    # ========================
+    # FREE - No API Key Required
+    # ========================
+    'spamhaus_drop': {
+        'name': 'Spamhaus DROP',
+        'description': 'Dont Route Or Peer - list of netblocks to drop (includes EDROP)',
+        'url': 'https://www.spamhaus.org/drop/drop.txt',
+        'auth_type': 'none',
+        'format': 'spamhaus_txt',
+        'category': 'ip_blocklist',
+        'default_filename': 'spamhaus_drop.csv',
+        'update_frequency': 'daily'
+    },
+    'feodo_tracker': {
+        'name': 'Feodo Tracker',
+        'description': 'Botnet C2 IP blocklist from abuse.ch',
+        'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist.csv',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'botnet_c2',
+        'default_filename': 'feodo_tracker.csv',
+        'update_frequency': 'hourly'
+    },
+    'urlhaus': {
+        'name': 'URLhaus',
+        'description': 'Malware URLs from abuse.ch',
+        'url': 'https://urlhaus.abuse.ch/downloads/csv_recent/',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'malware_urls',
+        'default_filename': 'urlhaus.csv',
+        'update_frequency': 'hourly'
+    },
+    'sslbl_ip': {
+        'name': 'SSL Blacklist IPs',
+        'description': 'Botnet C2 IPs identified by SSL certificates from abuse.ch',
+        'url': 'https://sslbl.abuse.ch/blacklist/sslipblacklist.csv',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'botnet_c2',
+        'default_filename': 'sslbl_ips.csv',
+        'update_frequency': 'daily'
+    },
+    'threatfox_iocs': {
+        'name': 'ThreatFox IOCs',
+        'description': 'Recent malware IOCs from abuse.ch ThreatFox',
+        'url': 'https://threatfox.abuse.ch/export/csv/recent/',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'threat_intel',
+        'default_filename': 'threatfox_iocs.csv',
+        'update_frequency': 'hourly'
+    },
+    'malware_bazaar_recent': {
+        'name': 'Malware Bazaar Recent',
+        'description': 'Recent malware hashes from abuse.ch',
+        'url': 'https://bazaar.abuse.ch/export/csv/recent/',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'malware_hashes',
+        'default_filename': 'malware_bazaar.csv',
+        'update_frequency': 'hourly'
+    },
+    'emerging_threats_compromised': {
+        'name': 'Emerging Threats Compromised IPs',
+        'description': 'Known compromised hosts from Proofpoint/ET',
+        'url': 'https://rules.emergingthreats.net/blockrules/compromised-ips.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'et_compromised.csv',
+        'update_frequency': 'daily'
+    },
+    'emerging_threats_tor': {
+        'name': 'Emerging Threats Tor Nodes',
+        'description': 'Tor exit nodes from Proofpoint/ET',
+        'url': 'https://rules.emergingthreats.net/blockrules/emerging-tor.rules',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'anonymizer',
+        'default_filename': 'et_tor.csv',
+        'update_frequency': 'daily'
+    },
+    'tor_exit_nodes': {
+        'name': 'Tor Exit Nodes (Official)',
+        'description': 'Official Tor Project exit node list',
+        'url': 'https://check.torproject.org/torbulkexitlist',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'anonymizer',
+        'default_filename': 'tor_exit_nodes.csv',
+        'update_frequency': 'hourly'
+    },
+    'blocklist_de': {
+        'name': 'Blocklist.de All Attacks',
+        'description': 'IPs that attacked services in the last 48 hours',
+        'url': 'https://lists.blocklist.de/lists/all.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'blocklist_de.csv',
+        'update_frequency': 'daily'
+    },
+    'blocklist_de_ssh': {
+        'name': 'Blocklist.de SSH Attacks',
+        'description': 'IPs attacking SSH services',
+        'url': 'https://lists.blocklist.de/lists/ssh.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'blocklist_de_ssh.csv',
+        'update_frequency': 'daily'
+    },
+    'blocklist_de_bruteforce': {
+        'name': 'Blocklist.de Brute Force',
+        'description': 'IPs conducting brute force attacks',
+        'url': 'https://lists.blocklist.de/lists/bruteforcelogin.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'blocklist_de_bruteforce.csv',
+        'update_frequency': 'daily'
+    },
+    'cinsscore': {
+        'name': 'CI Army Bad IPs',
+        'description': 'Bad reputation IPs from CI Army',
+        'url': 'https://cinsscore.com/list/ci-badguys.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'cinsscore.csv',
+        'update_frequency': 'daily'
+    },
+    'dshield_top20': {
+        'name': 'DShield Top 20 Attackers',
+        'description': 'Top attacking IPs from SANS DShield',
+        'url': 'https://www.dshield.org/block.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'dshield_top20.csv',
+        'update_frequency': 'daily'
+    },
+    'firehol_level1': {
+        'name': 'FireHOL Level 1',
+        'description': 'Basic IP blocklist with minimal false positives',
+        'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'firehol_level1.csv',
+        'update_frequency': 'daily'
+    },
+    'openphish': {
+        'name': 'OpenPhish Community',
+        'description': 'Phishing URLs (community feed)',
+        'url': 'https://openphish.com/feed.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'phishing',
+        'default_filename': 'openphish.csv',
+        'update_frequency': 'hourly'
+    },
+    'phishtank': {
+        'name': 'PhishTank',
+        'description': 'Verified phishing URLs (JSON feed)',
+        'url': 'http://data.phishtank.com/data/online-valid.json',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'phishing',
+        'default_filename': 'phishtank.csv',
+        'update_frequency': 'hourly'
+    },
+    'nist_nvd_cve': {
+        'name': 'NIST NVD Recent CVEs',
+        'description': 'Recent CVE data from NIST National Vulnerability Database',
+        'url': 'https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=2000',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'vulnerabilities',
+        'default_filename': 'nist_nvd_cves.csv',
+        'update_frequency': 'daily'
+    },
+    'botvrij_filenames': {
+        'name': 'Botvrij Malicious Filenames',
+        'description': 'Known malicious filenames from Botvrij.eu',
+        'url': 'https://www.botvrij.eu/data/ioclist.filename',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_iocs',
+        'default_filename': 'botvrij_filenames.csv',
+        'update_frequency': 'daily'
+    },
+    'botvrij_urls': {
+        'name': 'Botvrij Malicious URLs',
+        'description': 'Known malicious URLs from Botvrij.eu',
+        'url': 'https://www.botvrij.eu/data/ioclist.url',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_urls',
+        'default_filename': 'botvrij_urls.csv',
+        'update_frequency': 'daily'
+    },
+    'botvrij_domains': {
+        'name': 'Botvrij Malicious Domains',
+        'description': 'Known malicious domains from Botvrij.eu',
+        'url': 'https://www.botvrij.eu/data/ioclist.domain',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'botvrij_domains.csv',
+        'update_frequency': 'daily'
+    },
+    'digitalside_urls': {
+        'name': 'DigitalSide Malicious URLs',
+        'description': 'Malicious URLs from DigitalSide Threat Intel',
+        'url': 'https://osint.digitalside.it/Threat-Intel/lists/latesturls.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_urls',
+        'default_filename': 'digitalside_urls.csv',
+        'update_frequency': 'daily'
+    },
+    'digitalside_ips': {
+        'name': 'DigitalSide Malicious IPs',
+        'description': 'Malicious IPs from DigitalSide Threat Intel',
+        'url': 'https://osint.digitalside.it/Threat-Intel/lists/latestips.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'digitalside_ips.csv',
+        'update_frequency': 'daily'
+    },
+    'digitalside_domains': {
+        'name': 'DigitalSide Malicious Domains',
+        'description': 'Malicious domains from DigitalSide Threat Intel',
+        'url': 'https://osint.digitalside.it/Threat-Intel/lists/latestdomains.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'digitalside_domains.csv',
+        'update_frequency': 'daily'
+    },
+    'ipsum_threat': {
+        'name': 'IPsum Threat IPs',
+        'description': 'Daily aggregated threat IPs (level 3+)',
+        'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'ipsum_threat.csv',
+        'update_frequency': 'daily'
+    },
+    'binarydefense_banlist': {
+        'name': 'Binary Defense IP Banlist',
+        'description': 'IPs observed attacking honeypots',
+        'url': 'https://www.binarydefense.com/banlist.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'binarydefense.csv',
+        'update_frequency': 'daily'
+    },
+    'stamparm_maltrail': {
+        'name': 'Maltrail Blacklist',
+        'description': 'Malicious traffic IPs from Maltrail project',
+        'url': 'https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'maltrail_scanners.csv',
+        'update_frequency': 'daily'
+    },
+    'mirai_tracker': {
+        'name': 'Mirai Tracker',
+        'description': 'Active Mirai botnet C2 servers',
+        'url': 'https://mirai.security.gives/data/ip_list.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'botnet_c2',
+        'default_filename': 'mirai_c2.csv',
+        'update_frequency': 'hourly'
+    },
+    # ========================
+    # DOMAIN RANKINGS & ALLOWLISTS
+    # ========================
+    'majestic_million': {
+        'name': 'Majestic Million',
+        'description': 'Top 1 million domains ranked by referring subnets',
+        'url': 'https://downloads.majestic.com/majestic_million.csv',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'domain_ranking',
+        'default_filename': 'majestic_million.csv',
+        'update_frequency': 'daily'
+    },
+    'tranco_list': {
+        'name': 'Tranco Top Sites',
+        'description': 'Research-grade top sites list combining multiple rankings',
+        'url': 'https://tranco-list.eu/top-1m.csv.zip',
+        'auth_type': 'none',
+        'format': 'zip_csv',
+        'category': 'domain_ranking',
+        'default_filename': 'tranco_top1m.csv',
+        'update_frequency': 'daily'
+    },
+    'umbrella_top1m': {
+        'name': 'Cisco Umbrella Top 1M',
+        'description': 'Umbrella Popularity List - top 1 million DNS domains',
+        'url': 'http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip',
+        'auth_type': 'none',
+        'format': 'zip_csv',
+        'category': 'domain_ranking',
+        'default_filename': 'umbrella_top1m.csv',
+        'update_frequency': 'daily'
+    },
+    # ========================
+    # ADDITIONAL IP BLOCKLISTS
+    # ========================
+    'feodotracker_ips': {
+        'name': 'Feodo Tracker Botnet IPs',
+        'description': 'Feodo/Dridex/Emotet botnet C2 IPs from abuse.ch',
+        'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'botnet_c2',
+        'default_filename': 'feodotracker_ips.csv',
+        'update_frequency': 'hourly'
+    },
+    'sslbl_ips': {
+        'name': 'SSL Blacklist IPs',
+        'description': 'IPs associated with malicious SSL certificates',
+        'url': 'https://sslbl.abuse.ch/blacklist/sslipblacklist.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'sslbl_ips.csv',
+        'update_frequency': 'hourly'
+    },
+    'threatfox_ips': {
+        'name': 'ThreatFox IOCs',
+        'description': 'Indicators of compromise from ThreatFox/abuse.ch',
+        'url': 'https://threatfox.abuse.ch/export/json/recent/',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'threat_intel',
+        'default_filename': 'threatfox_iocs.csv',
+        'update_frequency': 'hourly'
+    },
+    'urlhaus_ips': {
+        'name': 'URLhaus Malware URLs',
+        'description': 'Malware distribution URLs from URLhaus/abuse.ch',
+        'url': 'https://urlhaus.abuse.ch/downloads/text_online/',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_urls',
+        'default_filename': 'urlhaus_urls.csv',
+        'update_frequency': 'hourly'
+    },
+    'spamhaus_drop': {
+        'name': 'Spamhaus DROP',
+        'description': "Don't Route Or Peer - hijacked/leased spam/malware networks",
+        'url': 'https://www.spamhaus.org/drop/drop.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'spamhaus_drop.csv',
+        'update_frequency': 'daily'
+    },
+    'spamhaus_edrop': {
+        'name': 'Spamhaus EDROP',
+        'description': 'Extended DROP - additional hijacked netblocks',
+        'url': 'https://www.spamhaus.org/drop/edrop.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'spamhaus_edrop.csv',
+        'update_frequency': 'daily'
+    },
+    'greensnow_blocklist': {
+        'name': 'GreenSnow Blocklist',
+        'description': 'IPs detected probing/attacking systems',
+        'url': 'https://blocklist.greensnow.co/greensnow.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'greensnow.csv',
+        'update_frequency': 'hourly'
+    },
+    'darklist_de': {
+        'name': 'Darklist.de Blocklist',
+        'description': 'SSH bruteforce attack IPs',
+        'url': 'https://www.darklist.de/raw.php',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'darklist_de.csv',
+        'update_frequency': 'hourly'
+    },
+    'emergingthreats_compromised': {
+        'name': 'ET Compromised IPs',
+        'description': 'Compromised IPs from Emerging Threats',
+        'url': 'https://rules.emergingthreats.net/blockrules/compromised-ips.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'et_compromised.csv',
+        'update_frequency': 'daily'
+    },
+    'talos_ip_blacklist': {
+        'name': 'Cisco Talos IP Blacklist',
+        'description': 'Known malicious IPs from Talos Intelligence',
+        'url': 'https://talosintelligence.com/documents/ip-blacklist',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'talos_blacklist.csv',
+        'update_frequency': 'daily'
+    },
+    'firehol_level2': {
+        'name': 'FireHOL Level 2',
+        'description': 'Moderate risk IP blocklist with some false positives',
+        'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'firehol_level2.csv',
+        'update_frequency': 'daily'
+    },
+    'firehol_level3': {
+        'name': 'FireHOL Level 3',
+        'description': 'Higher risk IPs - more aggressive blocking',
+        'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level3.netset',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ip_blocklist',
+        'default_filename': 'firehol_level3.csv',
+        'update_frequency': 'daily'
+    },
+    # ========================
+    # RANSOMWARE & MALWARE
+    # ========================
+    'ransomware_tracker': {
+        'name': 'Ransomware Tracker URLs',
+        'description': 'Known ransomware payment/distribution URLs',
+        'url': 'https://ransomwaretracker.abuse.ch/downloads/RW_URLBL.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'ransomware',
+        'default_filename': 'ransomware_urls.csv',
+        'update_frequency': 'hourly'
+    },
+    'malwaredomains_immortal': {
+        'name': 'DNS-BH Malware Domains',
+        'description': 'Domains serving malware from Malware Domain List',
+        'url': 'http://mirror1.malwaredomains.com/files/immortal_domains.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'malware_immortal.csv',
+        'update_frequency': 'daily'
+    },
+    'bazaar_recent': {
+        'name': 'MalwareBazaar Recent Samples',
+        'description': 'Recent malware samples from MalwareBazaar/abuse.ch',
+        'url': 'https://bazaar.abuse.ch/export/txt/recent/',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_iocs',
+        'default_filename': 'malware_bazaar.csv',
+        'update_frequency': 'hourly'
+    },
+    # ========================
+    # DOMAIN BLOCKLISTS
+    # ========================
+    'malwaredomainlist': {
+        'name': 'Malware Domain List',
+        'description': 'Domains hosting/distributing malware',
+        'url': 'https://www.malwaredomainlist.com/hostslist/hosts.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'malware_domain_list.csv',
+        'update_frequency': 'daily'
+    },
+    'urlvoid_domains': {
+        'name': 'URLVoid Suspicious Domains',
+        'description': 'Suspicious domains from URLVoid analysis',
+        'url': 'http://www.urlvoid.com/export-hosts/',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'urlvoid_domains.csv',
+        'update_frequency': 'daily'
+    },
+    'disconnect_malware': {
+        'name': 'Disconnect Malware Domains',
+        'description': 'Malware domains from Disconnect tracking protection',
+        'url': 'https://s3.amazonaws.com/lists.disconnect.me/simple_malware.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'disconnect_malware.csv',
+        'update_frequency': 'daily'
+    },
+    # ========================
+    # CRYPTOMINING & AD/TRACKING
+    # ========================
+    'cryptominer_domains': {
+        'name': 'Cryptominer Domains',
+        'description': 'Domains hosting browser cryptominers',
+        'url': 'https://raw.githubusercontent.com/nickspaargaren/pihole-google/master/categories/cryptomining.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'cryptomining',
+        'default_filename': 'cryptominer_domains.csv',
+        'update_frequency': 'weekly'
+    },
+    'adaway_hosts': {
+        'name': 'AdAway Hosts',
+        'description': 'Ad server domains for blocking',
+        'url': 'https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'advertising',
+        'default_filename': 'adaway_hosts.csv',
+        'update_frequency': 'weekly'
+    },
+    'easylist_privacy': {
+        'name': 'EasyPrivacy Tracking Domains',
+        'description': 'Privacy/tracking domains from EasyList',
+        'url': 'https://raw.githubusercontent.com/nickspaargaren/pihole-google/master/categories/tracking.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'tracking',
+        'default_filename': 'easyprivacy_tracking.csv',
+        'update_frequency': 'weekly'
+    },
+    # ========================
+    # VPN/PROXY/ANONYMIZERS
+    # ========================
+    'dan_tor_nodes': {
+        'name': 'Dan.me.uk Tor Nodes',
+        'description': 'All Tor network nodes (not just exits)',
+        'url': 'https://www.dan.me.uk/torlist/?full',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'anonymizer',
+        'default_filename': 'dan_tor_nodes.csv',
+        'update_frequency': 'hourly'
+    },
+    'proxy_list': {
+        'name': 'Free Proxy List',
+        'description': 'Known public proxy server IPs',
+        'url': 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'proxy',
+        'default_filename': 'proxy_list.csv',
+        'update_frequency': 'hourly'
+    },
+    # ========================
+    # DATACENTER/CLOUD IPS
+    # ========================
+    'aws_ip_ranges': {
+        'name': 'AWS IP Ranges',
+        'description': 'Official Amazon Web Services IP ranges',
+        'url': 'https://ip-ranges.amazonaws.com/ip-ranges.json',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'cloud_provider',
+        'default_filename': 'aws_ip_ranges.csv',
+        'update_frequency': 'daily'
+    },
+    'azure_ip_ranges': {
+        'name': 'Azure IP Ranges',
+        'description': 'Microsoft Azure datacenter IP ranges',
+        'url': 'https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20231127.json',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'cloud_provider',
+        'default_filename': 'azure_ip_ranges.csv',
+        'update_frequency': 'weekly'
+    },
+    'google_cloud_ips': {
+        'name': 'Google Cloud IP Ranges',
+        'description': 'Google Cloud Platform IP ranges',
+        'url': 'https://www.gstatic.com/ipranges/cloud.json',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'cloud_provider',
+        'default_filename': 'gcp_ip_ranges.csv',
+        'update_frequency': 'daily'
+    },
+    'cloudflare_ips': {
+        'name': 'Cloudflare IP Ranges',
+        'description': 'Cloudflare CDN/proxy IP ranges',
+        'url': 'https://www.cloudflare.com/ips-v4',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'cdn',
+        'default_filename': 'cloudflare_ips.csv',
+        'update_frequency': 'weekly'
+    },
+    'fastly_ips': {
+        'name': 'Fastly IP Ranges',
+        'description': 'Fastly CDN IP ranges',
+        'url': 'https://api.fastly.com/public-ip-list',
+        'auth_type': 'none',
+        'format': 'json',
+        'category': 'cdn',
+        'default_filename': 'fastly_ips.csv',
+        'update_frequency': 'weekly'
+    },
+    # ========================
+    # COUNTRY/ASN DATA
+    # ========================
+    'asn_database': {
+        'name': 'IPtoASN Database',
+        'description': 'IP to ASN mapping database',
+        'url': 'https://iptoasn.com/data/ip2asn-v4.tsv.gz',
+        'auth_type': 'none',
+        'format': 'gzip_tsv',
+        'category': 'network_intel',
+        'default_filename': 'ip2asn.csv',
+        'update_frequency': 'weekly'
+    },
+    # ========================
+    # ADDITIONAL THREAT FEEDS
+    # ========================
+    'c2_intel_feed': {
+        'name': 'C2 IntelFeed',
+        'description': 'Command and Control server indicators',
+        'url': 'https://raw.githubusercontent.com/drb-ra/C2IntelFeeds/master/feeds/IPC2s.csv',
+        'auth_type': 'none',
+        'format': 'csv',
+        'category': 'botnet_c2',
+        'default_filename': 'c2_intel.csv',
+        'update_frequency': 'daily'
+    },
+    'vxvault_urls': {
+        'name': 'VXVault URLs',
+        'description': 'Malware distribution URLs from VXVault',
+        'url': 'http://vxvault.net/URL_List.php',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_urls',
+        'default_filename': 'vxvault_urls.csv',
+        'update_frequency': 'daily'
+    },
+    'cybercrime_tracker': {
+        'name': 'Cybercrime Tracker',
+        'description': 'Active C2 panels (Zeus, SpyEye, etc)',
+        'url': 'https://cybercrime-tracker.net/all.php',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'botnet_c2',
+        'default_filename': 'cybercrime_c2.csv',
+        'update_frequency': 'daily'
+    },
+    'threatcrowd_domains': {
+        'name': 'ThreatCrowd Domains',
+        'description': 'Malicious domain intelligence',
+        'url': 'https://www.threatcrowd.org/feeds/domains.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'malware_domains',
+        'default_filename': 'threatcrowd_domains.csv',
+        'update_frequency': 'daily'
+    },
+    'iana_tlds': {
+        'name': 'IANA TLD List',
+        'description': 'Official list of all Top-Level Domains',
+        'url': 'https://data.iana.org/TLD/tlds-alpha-by-domain.txt',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'reference',
+        'default_filename': 'iana_tlds.csv',
+        'update_frequency': 'weekly'
+    },
+    'public_suffix_list': {
+        'name': 'Public Suffix List',
+        'description': 'Domain suffixes where cookies should not be set',
+        'url': 'https://publicsuffix.org/list/public_suffix_list.dat',
+        'auth_type': 'none',
+        'format': 'txt_lines',
+        'category': 'reference',
+        'default_filename': 'public_suffix.csv',
+        'update_frequency': 'weekly'
+    },
+    # ========================
+    # REQUIRES API KEY
+    # ========================
+    'alienvault_otx': {
+        'name': 'AlienVault OTX',
+        'description': 'Open Threat Exchange indicators (requires free API key)',
+        'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed',
+        'auth_type': 'api_key_header',
+        'auth_header': 'X-OTX-API-KEY',
+        'format': 'json',
+        'category': 'threat_intel',
+        'default_filename': 'alienvault_otx.csv',
+        'update_frequency': 'daily'
+    },
+    'abuseipdb': {
+        'name': 'AbuseIPDB Blacklist',
+        'description': 'IP addresses reported for abuse (requires API key)',
+        'url': 'https://api.abuseipdb.com/api/v2/blacklist',
+        'auth_type': 'api_key_header',
+        'auth_header': 'Key',
+        'format': 'json',
+        'category': 'ip_blocklist',
+        'default_filename': 'abuseipdb.csv',
+        'update_frequency': 'daily',
+        'extra_params': {'confidenceMinimum': '90'}
+    },
+    'maxmind_geolite2_country': {
+        'name': 'MaxMind GeoLite2 Country',
+        'description': 'GeoIP country database (requires free license key)',
+        'url': 'https://download.maxmind.com/geoip/databases/GeoLite2-Country-CSV/download',
+        'auth_type': 'basic_auth',
+        'format': 'zip_csv',
+        'category': 'geolocation',
+        'default_filename': 'geolite2_country.csv',
+        'update_frequency': 'weekly'
+    },
+    'maxmind_geolite2_city': {
+        'name': 'MaxMind GeoLite2 City',
+        'description': 'GeoIP city database (requires free license key)',
+        'url': 'https://download.maxmind.com/geoip/databases/GeoLite2-City-CSV/download',
+        'auth_type': 'basic_auth',
+        'format': 'zip_csv',
+        'category': 'geolocation',
+        'default_filename': 'geolite2_city.csv',
+        'update_frequency': 'weekly'
+    },
+    'maxmind_geolite2_asn': {
+        'name': 'MaxMind GeoLite2 ASN',
+        'description': 'GeoIP ASN database (requires free license key)',
+        'url': 'https://download.maxmind.com/geoip/databases/GeoLite2-ASN-CSV/download',
+        'auth_type': 'basic_auth',
+        'format': 'zip_csv',
+        'category': 'geolocation',
+        'default_filename': 'geolite2_asn.csv',
+        'update_frequency': 'weekly'
+    },
+    'greynoise_community': {
+        'name': 'GreyNoise Community',
+        'description': 'Internet scanner and noise IPs (requires API key)',
+        'url': 'https://api.greynoise.io/v3/community/{ip}',
+        'auth_type': 'api_key_header',
+        'auth_header': 'key',
+        'format': 'json',
+        'category': 'ip_context',
+        'default_filename': 'greynoise.csv',
+        'update_frequency': 'daily',
+        'note': 'Query individual IPs only'
+    },
+    'ipinfo_country': {
+        'name': 'IPinfo Country ASN',
+        'description': 'Free IP to country/ASN database from IPinfo.io (requires free account)',
+        'url': 'https://ipinfo.io/data/free/country_asn.csv.gz',
+        'auth_type': 'api_key_header',
+        'auth_header': 'Authorization',
+        'auth_prefix': 'Bearer ',
+        'format': 'gzip_csv',
+        'category': 'geolocation',
+        'default_filename': 'ipinfo_country.csv',
+        'update_frequency': 'daily',
+        'signup_url': 'https://ipinfo.io/signup'
+    },
+    'ipinfodb_city': {
+        'name': 'IP2Location LITE City',
+        'description': 'Free IP geolocation database - no API key required',
+        'url': 'https://download.ip2location.com/lite/IP2LOCATION-LITE-DB11.CSV.ZIP',
+        'auth_type': 'none',
+        'format': 'zip_csv',
+        'category': 'geolocation',
+        'default_filename': 'ip2location_city.csv',
+        'update_frequency': 'monthly',
+        'note': 'Free IP2Location LITE database - no registration required'
+    },
+    'nist_nvd_nginx': {
+        'name': 'NIST NVD - Nginx CVEs',
+        'description': 'NIST National Vulnerability Database CVEs for Nginx',
+        'url': 'https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:a:*:nginx:*:*:*:*:*:*:*:*',
+        'auth_type': 'none',
+        'format': 'nvd_json',
+        'category': 'vulnerability',
+        'default_filename': 'nvd_nginx_cves.csv',
+        'update_frequency': 'daily'
+    }
+}
+
+# Default feeds to pre-configure (disabled, not scheduled)
+# schedule_cron format: "minute hour day_of_month month day_of_week"
+# Example: "0 6 * * *" = daily at 6:00 AM, "0 6 * * 1,3,5" = Mon/Wed/Fri at 6:00 AM
+# This list is auto-generated from FEED_PROVIDERS for all free (no auth required) feeds
+# Only verified working free feeds (no auth required)
+# Non-working feeds have been removed but remain in FEED_PROVIDERS for manual addition via "Add Feed" button
+DEFAULT_FEEDS = [
+    # === IP Blocklists (Verified Working) ===
+    {'provider_id': 'spamhaus_drop', 'name': 'Spamhaus DROP', 'lookup_filename': 'spamhaus_drop.csv', 'schedule_cron': '0 2 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'blocklist_de', 'name': 'Blocklist.de All Attacks', 'lookup_filename': 'blocklist_de.csv', 'schedule_cron': '0 3 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'blocklist_de_ssh', 'name': 'Blocklist.de SSH Attacks', 'lookup_filename': 'blocklist_de_ssh.csv', 'schedule_cron': '0 3 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'blocklist_de_bruteforce', 'name': 'Blocklist.de Brute Force', 'lookup_filename': 'blocklist_de_bruteforce.csv', 'schedule_cron': '0 3 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'firehol_level1', 'name': 'FireHOL Level 1', 'lookup_filename': 'firehol_level1.csv', 'schedule_cron': '0 4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'firehol_level2', 'name': 'FireHOL Level 2', 'lookup_filename': 'firehol_level2.csv', 'schedule_cron': '0 4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'firehol_level3', 'name': 'FireHOL Level 3', 'lookup_filename': 'firehol_level3.csv', 'schedule_cron': '0 4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'emerging_threats_compromised', 'name': 'ET Compromised IPs', 'lookup_filename': 'et_compromised.csv', 'schedule_cron': '0 5 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'emergingthreats_compromised', 'name': 'Emerging Threats Compromised', 'lookup_filename': 'et_compromised2.csv', 'schedule_cron': '0 5 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'cinsscore', 'name': 'CI Army Bad IPs', 'lookup_filename': 'cinsscore.csv', 'schedule_cron': '0 6 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'dshield_top20', 'name': 'DShield Top 20 Attackers', 'lookup_filename': 'dshield_top20.csv', 'schedule_cron': '0 6 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'binarydefense_banlist', 'name': 'Binary Defense IP Banlist', 'lookup_filename': 'binarydefense.csv', 'schedule_cron': '0 7 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'ipsum_threat', 'name': 'IPsum Threat IPs', 'lookup_filename': 'ipsum_threat.csv', 'schedule_cron': '0 7 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'stamparm_maltrail', 'name': 'Maltrail Blacklist', 'lookup_filename': 'maltrail_scanners.csv', 'schedule_cron': '0 8 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'greensnow_blocklist', 'name': 'GreenSnow Blocklist', 'lookup_filename': 'greensnow.csv', 'schedule_cron': '0 8 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Botnet C2 (Verified Working) ===
+    {'provider_id': 'feodo_tracker', 'name': 'Feodo Tracker', 'lookup_filename': 'feodo_tracker.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'feodotracker_ips', 'name': 'Feodo Tracker Botnet IPs', 'lookup_filename': 'feodotracker_ips.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'c2_intel_feed', 'name': 'C2 IntelFeed', 'lookup_filename': 'c2_intel.csv', 'schedule_cron': '0 12 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'cybercrime_tracker', 'name': 'Cybercrime Tracker', 'lookup_filename': 'cybercrime_c2.csv', 'schedule_cron': '0 12 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Threat Intel (Verified Working) ===
+    {'provider_id': 'threatfox_iocs', 'name': 'ThreatFox IOCs', 'lookup_filename': 'threatfox_iocs.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Malware URLs (Verified Working) ===
+    {'provider_id': 'urlhaus', 'name': 'URLhaus Malware URLs', 'lookup_filename': 'urlhaus.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'urlhaus_ips', 'name': 'URLhaus Online URLs', 'lookup_filename': 'urlhaus_urls.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'vxvault_urls', 'name': 'VXVault URLs', 'lookup_filename': 'vxvault_urls.csv', 'schedule_cron': '0 13 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'botvrij_urls', 'name': 'Botvrij Malicious URLs', 'lookup_filename': 'botvrij_urls.csv', 'schedule_cron': '0 14 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Phishing (Verified Working) ===
+    {'provider_id': 'openphish', 'name': 'OpenPhish Community', 'lookup_filename': 'openphish.csv', 'schedule_cron': '0 */6 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Malware Hashes/IOCs (Verified Working) ===
+    {'provider_id': 'malware_bazaar_recent', 'name': 'Malware Bazaar Recent', 'lookup_filename': 'malware_bazaar.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'botvrij_filenames', 'name': 'Botvrij Malicious Filenames', 'lookup_filename': 'botvrij_filenames.csv', 'schedule_cron': '0 15 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Malware Domains (Verified Working) ===
+    {'provider_id': 'botvrij_domains', 'name': 'Botvrij Malicious Domains', 'lookup_filename': 'botvrij_domains.csv', 'schedule_cron': '0 15 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Anonymizers/Tor/Proxy (Verified Working) ===
+    {'provider_id': 'tor_exit_nodes', 'name': 'Tor Exit Nodes (Official)', 'lookup_filename': 'tor_exit_nodes.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'emerging_threats_tor', 'name': 'ET Tor Nodes', 'lookup_filename': 'et_tor.csv', 'schedule_cron': '0 18 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'proxy_list', 'name': 'Free Proxy List', 'lookup_filename': 'proxy_list.csv', 'schedule_cron': '0 */4 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Domain Rankings/Allowlists (Verified Working) ===
+    {'provider_id': 'majestic_million', 'name': 'Majestic Million', 'lookup_filename': 'majestic_million.csv', 'schedule_cron': '0 1 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'tranco_list', 'name': 'Tranco Top Sites', 'lookup_filename': 'tranco_top1m.csv', 'schedule_cron': '0 1 * * *', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'umbrella_top1m', 'name': 'Cisco Umbrella Top 1M', 'lookup_filename': 'umbrella_top1m.csv', 'schedule_cron': '0 1 * * *', 'enabled': False, 'auto_deploy': False},
+    # === Cloud Provider IPs (Verified Working) ===
+    {'provider_id': 'cloudflare_ips', 'name': 'Cloudflare IP Ranges', 'lookup_filename': 'cloudflare_ips.csv', 'schedule_cron': '0 3 * * 0', 'enabled': False, 'auto_deploy': False},
+    # === Reference Data (Verified Working) ===
+    {'provider_id': 'iana_tlds', 'name': 'IANA TLD List', 'lookup_filename': 'iana_tlds.csv', 'schedule_cron': '0 5 * * 0', 'enabled': False, 'auto_deploy': False},
+    {'provider_id': 'public_suffix_list', 'name': 'Public Suffix List', 'lookup_filename': 'public_suffix.csv', 'schedule_cron': '0 5 * * 0', 'enabled': False, 'auto_deploy': False},
+    # === Ad/Tracking (Verified Working) ===
+    {'provider_id': 'adaway_hosts', 'name': 'AdAway Hosts', 'lookup_filename': 'adaway_hosts.csv', 'schedule_cron': '0 7 * * 0', 'enabled': False, 'auto_deploy': False},
+    # NOTE: Non-working feeds and API-key-required feeds remain in FEED_PROVIDERS and can be added via "Add Feed" button
+]
+
+def init_marketplace_db():
+    """Initialize the SQLite database for Marketplace feed configurations."""
+    conn = sqlite3.connect(MARKETPLACE_DB_PATH)
+    cursor = conn.cursor()
+
+    # Create feeds table with schedule_cron (full cron expression: minute hour day_of_month month day_of_week)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            enabled INTEGER DEFAULT 0,
+            lookup_filename TEXT NOT NULL,
+            schedule_cron TEXT DEFAULT '0 6 * * *',
+            target_api_type TEXT DEFAULT 'stream',
+            target_worker_groups TEXT DEFAULT 'default',
+            auto_deploy INTEGER DEFAULT 0,
+            auth_config TEXT,
+            last_sync TEXT,
+            last_sync_status TEXT,
+            last_sync_message TEXT,
+            content_hash TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Create sync history table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sync_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER NOT NULL,
+            sync_time TEXT DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL,
+            message TEXT,
+            records_count INTEGER,
+            content_hash TEXT,
+            preview_data TEXT,
+            FOREIGN KEY (feed_id) REFERENCES feeds(id)
+        )
+    ''')
+
+    # Add preview_data column to sync_history if it doesn't exist
+    cursor.execute("PRAGMA table_info(sync_history)")
+    sync_columns = [col[1] for col in cursor.fetchall()]
+    if 'preview_data' not in sync_columns:
+        cursor.execute("ALTER TABLE sync_history ADD COLUMN preview_data TEXT")
+
+    # Check if we need to migrate old schema (schedule_time -> schedule_cron)
+    cursor.execute("PRAGMA table_info(feeds)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'schedule_time' in columns and 'schedule_cron' not in columns:
+        # Add new column and migrate data
+        cursor.execute("ALTER TABLE feeds ADD COLUMN schedule_cron TEXT DEFAULT '0 6 * * *'")
+        # Convert old HH:MM time format to cron (daily at that time)
+        cursor.execute("SELECT id, schedule_time FROM feeds WHERE schedule_time IS NOT NULL")
+        for row in cursor.fetchall():
+            feed_id, schedule_time = row
+            if schedule_time and ':' in schedule_time:
+                parts = schedule_time.split(':')
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+                cron_expr = f"{minute} {hour} * * *"
+                cursor.execute("UPDATE feeds SET schedule_cron = ? WHERE id = ?", (cron_expr, feed_id))
+        debug_log("[MARKETPLACE] Migrated schedule schema from time to cron-based")
+
+    # Insert default feeds if table is empty
+    cursor.execute("SELECT COUNT(*) FROM feeds")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        debug_log("[MARKETPLACE] Inserting default feed configurations...")
+        for feed in DEFAULT_FEEDS:
+            cursor.execute('''
+                INSERT INTO feeds (provider_id, name, lookup_filename, schedule_cron, enabled, auto_deploy, target_worker_groups)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                feed['provider_id'],
+                feed['name'],
+                feed['lookup_filename'],
+                feed['schedule_cron'],
+                1 if feed.get('enabled', False) else 0,
+                1 if feed.get('auto_deploy', False) else 0,
+                ''  # Empty - user must configure target worker groups
+            ))
+        debug_log(f"[MARKETPLACE] Inserted {len(DEFAULT_FEEDS)} default feeds")
+
+    conn.commit()
+    conn.close()
+    debug_log("[MARKETPLACE] Database initialized")
+
+def get_db_connection():
+    """Get a database connection with row factory."""
+    conn = sqlite3.connect(MARKETPLACE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def feed_row_to_dict(row):
+    """Convert a sqlite3.Row to a dictionary."""
+    if row is None:
+        return None
+    return dict(row)
+
+# =============================================================================
+# MARKETPLACE - Feed Download and Parsing Functions
+# =============================================================================
+
+def download_feed_content(provider_id, auth_config=None):
+    """
+    Download content from a feed provider.
+
+    Args:
+        provider_id: The provider ID from FEED_PROVIDERS
+        auth_config: Optional dict with authentication credentials
+
+    Returns:
+        tuple: (content_bytes, error_message)
+    """
+    provider = FEED_PROVIDERS.get(provider_id)
+    if not provider:
+        return None, f"Unknown provider: {provider_id}"
+
+    url = provider['url']
+    headers = {}
+    auth = None
+    params = provider.get('extra_params', {})
+
+    # Handle authentication
+    auth_type = provider.get('auth_type', 'none')
+    if auth_type == 'api_key_header' and auth_config:
+        header_name = provider.get('auth_header', 'Authorization')
+        api_key = auth_config.get('api_key', '')
+        if api_key:
+            headers[header_name] = api_key
+    elif auth_type == 'basic_auth' and auth_config:
+        username = auth_config.get('account_id', auth_config.get('username', ''))
+        password = auth_config.get('license_key', auth_config.get('password', ''))
+        if username and password:
+            auth = (username, password)
+
+    # Add Accept header for JSON APIs
+    if provider.get('format') == 'json':
+        headers['Accept'] = 'application/json'
+
+    try:
+        response = requests.get(url, headers=headers, auth=auth, params=params, timeout=60)
+        response.raise_for_status()
+        return response.content, None
+    except requests.exceptions.RequestException as e:
+        return None, str(e)
+
+def parse_feed_to_csv(provider_id, content):
+    """
+    Parse feed content and convert to CSV format suitable for Cribl lookups.
+
+    Args:
+        provider_id: The provider ID from FEED_PROVIDERS
+        content: Raw content bytes from download
+
+    Returns:
+        tuple: (csv_content_string, record_count, error_message)
+    """
+    provider = FEED_PROVIDERS.get(provider_id)
+    if not provider:
+        return None, 0, f"Unknown provider: {provider_id}"
+
+    format_type = provider.get('format', 'csv')
+
+    try:
+        if format_type == 'json':
+            return parse_json_feed(provider_id, content)
+        elif format_type == 'csv':
+            return parse_csv_feed(provider_id, content)
+        elif format_type == 'txt_lines':
+            return parse_txt_lines_feed(provider_id, content)
+        elif format_type == 'zip_csv':
+            return parse_zip_csv_feed(provider_id, content)
+        elif format_type == 'spamhaus_txt':
+            return parse_spamhaus_txt(provider_id, content)
+        elif format_type == 'nvd_json':
+            return parse_nvd_json(provider_id, content)
+        else:
+            return None, 0, f"Unsupported format: {format_type}"
+    except Exception as e:
+        return None, 0, f"Parse error: {str(e)}"
+
+def parse_json_feed(provider_id, content):
+    """Parse JSON format feeds."""
+    data = json.loads(content.decode('utf-8'))
+    output = StringIO()
+    writer = None
+    count = 0
+
+    if provider_id == 'spamhaus_drop' or provider_id == 'spamhaus_edrop':
+        # Spamhaus DROP JSON format
+        writer = csv.DictWriter(output, fieldnames=['cidr', 'sbl_id', 'rir', 'country'])
+        writer.writeheader()
+        for entry in data:
+            writer.writerow({
+                'cidr': entry.get('cidr', ''),
+                'sbl_id': entry.get('sbl', ''),
+                'rir': entry.get('rir', ''),
+                'country': entry.get('country', '')
+            })
+            count += 1
+
+    elif provider_id == 'abuseipdb':
+        # AbuseIPDB blacklist format
+        writer = csv.DictWriter(output, fieldnames=['ip', 'country_code', 'abuse_confidence_score', 'last_reported_at'])
+        writer.writeheader()
+        for entry in data.get('data', []):
+            writer.writerow({
+                'ip': entry.get('ipAddress', ''),
+                'country_code': entry.get('countryCode', ''),
+                'abuse_confidence_score': entry.get('abuseConfidenceScore', ''),
+                'last_reported_at': entry.get('lastReportedAt', '')
+            })
+            count += 1
+
+    elif provider_id == 'alienvault_otx':
+        # AlienVault OTX pulses - extract indicators
+        writer = csv.DictWriter(output, fieldnames=['indicator', 'type', 'pulse_name', 'created'])
+        writer.writeheader()
+        for pulse in data.get('results', []):
+            pulse_name = pulse.get('name', '')
+            for indicator in pulse.get('indicators', []):
+                writer.writerow({
+                    'indicator': indicator.get('indicator', ''),
+                    'type': indicator.get('type', ''),
+                    'pulse_name': pulse_name,
+                    'created': indicator.get('created', '')
+                })
+                count += 1
+
+    else:
+        # Generic JSON array handling
+        if isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                writer = csv.DictWriter(output, fieldnames=data[0].keys())
+                writer.writeheader()
+                for row in data:
+                    writer.writerow(row)
+                    count += 1
+
+    return output.getvalue(), count, None
+
+def parse_spamhaus_txt(provider_id, content):
+    """Parse Spamhaus DROP/EDROP text format (CIDR ; SBL_ID)."""
+    text = content.decode('utf-8', errors='replace')
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=['cidr', 'sbl_id', 'source'])
+    writer.writeheader()
+    count = 0
+
+    provider = FEED_PROVIDERS.get(provider_id, {})
+    source_name = provider.get('name', provider_id)
+
+    for line in text.split('\n'):
+        line = line.strip()
+        # Skip empty lines and comments (start with ;)
+        if line and not line.startswith(';'):
+            # Format: CIDR ; SBL_ID
+            parts = line.split(';', 1)
+            cidr = parts[0].strip()
+            sbl_id = parts[1].strip() if len(parts) > 1 else ''
+            if cidr:
+                writer.writerow({
+                    'cidr': cidr,
+                    'sbl_id': sbl_id,
+                    'source': source_name
+                })
+                count += 1
+
+    return output.getvalue(), count, None
+
+def parse_nvd_json(provider_id, content):
+    """Parse NIST NVD JSON format (CVE vulnerability data)."""
+    data = json.loads(content.decode('utf-8'))
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        'cve_id', 'published', 'last_modified', 'severity', 'cvss_score',
+        'cvss_version', 'vuln_status', 'description', 'cpe_match'
+    ])
+    writer.writeheader()
+    count = 0
+
+    # NVD API 2.0 returns vulnerabilities array
+    vulnerabilities = data.get('vulnerabilities', [])
+
+    for vuln_wrapper in vulnerabilities:
+        cve = vuln_wrapper.get('cve', {})
+        cve_id = cve.get('id', '')
+        published = cve.get('published', '')
+        last_modified = cve.get('lastModified', '')
+        vuln_status = cve.get('vulnStatus', '')
+
+        # Get description (English)
+        description = ''
+        for desc in cve.get('descriptions', []):
+            if desc.get('lang') == 'en':
+                description = desc.get('value', '')
+                break
+
+        # Get CVSS score - try v3.1 first, then v3.0, then v2
+        severity = ''
+        cvss_score = ''
+        cvss_version = ''
+
+        metrics = cve.get('metrics', {})
+        if 'cvssMetricV31' in metrics and metrics['cvssMetricV31']:
+            cvss_data = metrics['cvssMetricV31'][0].get('cvssData', {})
+            cvss_score = str(cvss_data.get('baseScore', ''))
+            severity = cvss_data.get('baseSeverity', '')
+            cvss_version = '3.1'
+        elif 'cvssMetricV30' in metrics and metrics['cvssMetricV30']:
+            cvss_data = metrics['cvssMetricV30'][0].get('cvssData', {})
+            cvss_score = str(cvss_data.get('baseScore', ''))
+            severity = cvss_data.get('baseSeverity', '')
+            cvss_version = '3.0'
+        elif 'cvssMetricV2' in metrics and metrics['cvssMetricV2']:
+            metric = metrics['cvssMetricV2'][0]
+            cvss_data = metric.get('cvssData', {})
+            cvss_score = str(cvss_data.get('baseScore', ''))
+            severity = metric.get('baseSeverity', '')
+            cvss_version = '2.0'
+
+        # Get CPE match string (affected products)
+        cpe_matches = []
+        for config in cve.get('configurations', []):
+            for node in config.get('nodes', []):
+                for match in node.get('cpeMatch', []):
+                    if match.get('vulnerable'):
+                        cpe_matches.append(match.get('criteria', ''))
+        cpe_match = '; '.join(cpe_matches[:5])  # Limit to first 5
+
+        writer.writerow({
+            'cve_id': cve_id,
+            'published': published,
+            'last_modified': last_modified,
+            'severity': severity,
+            'cvss_score': cvss_score,
+            'cvss_version': cvss_version,
+            'vuln_status': vuln_status,
+            'description': description[:500] if description else '',  # Truncate long descriptions
+            'cpe_match': cpe_match
+        })
+        count += 1
+
+    return output.getvalue(), count, None
+
+def parse_csv_feed(provider_id, content):
+    """Parse CSV format feeds."""
+    text = content.decode('utf-8', errors='replace')
+    output = StringIO()
+    count = 0
+
+    if provider_id == 'feodo_tracker':
+        # Feodo Tracker CSV has comment lines starting with #
+        # Format: first_seen_utc, dst_ip, dst_port, c2_status, last_online, malware
+        writer = csv.DictWriter(output, fieldnames=['first_seen', 'dst_ip', 'dst_port', 'c2_status', 'last_online', 'malware'])
+        writer.writeheader()
+        for line in text.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('"first_seen'):
+                # Parse CSV line properly (handles quoted fields)
+                reader = csv.reader(StringIO(line))
+                for parts in reader:
+                    if len(parts) >= 6:
+                        writer.writerow({
+                            'first_seen': parts[0],
+                            'dst_ip': parts[1],
+                            'dst_port': parts[2],
+                            'c2_status': parts[3],
+                            'last_online': parts[4],
+                            'malware': parts[5]
+                        })
+                        count += 1
+
+    elif provider_id == 'urlhaus':
+        # URLhaus CSV has specific format with # comments
+        writer = csv.DictWriter(output, fieldnames=['id', 'dateadded', 'url', 'url_status', 'threat', 'tags', 'urlhaus_link', 'reporter'])
+        writer.writeheader()
+        for line in text.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                # Parse CSV line properly
+                reader = csv.reader(StringIO(line))
+                for parts in reader:
+                    if len(parts) >= 8:
+                        writer.writerow({
+                            'id': parts[0],
+                            'dateadded': parts[1],
+                            'url': parts[2],
+                            'url_status': parts[3],
+                            'threat': parts[4],
+                            'tags': parts[5],
+                            'urlhaus_link': parts[6],
+                            'reporter': parts[7]
+                        })
+                        count += 1
+
+    else:
+        # Generic CSV passthrough with header
+        reader = csv.reader(StringIO(text))
+        headers = next(reader, None)
+        if headers:
+            writer = csv.writer(output)
+            writer.writerow(headers)
+            for row in reader:
+                writer.writerow(row)
+                count += 1
+
+    return output.getvalue(), count, None
+
+def parse_txt_lines_feed(provider_id, content):
+    """Parse text file with one entry per line (IPs, domains, etc.)."""
+    text = content.decode('utf-8', errors='replace')
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=['indicator', 'source', 'added_date'])
+    writer.writeheader()
+    count = 0
+
+    provider = FEED_PROVIDERS.get(provider_id, {})
+    source_name = provider.get('name', provider_id)
+    added_date = datetime.utcnow().strftime('%Y-%m-%d')
+
+    for line in text.split('\n'):
+        line = line.strip()
+        # Skip empty lines and comments
+        if line and not line.startswith('#') and not line.startswith(';'):
+            writer.writerow({
+                'indicator': line,
+                'source': source_name,
+                'added_date': added_date
+            })
+            count += 1
+
+    return output.getvalue(), count, None
+
+def parse_zip_csv_feed(provider_id, content):
+    """Parse ZIP files containing CSV (like MaxMind databases)."""
+    import zipfile
+
+    output = StringIO()
+    count = 0
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            # Find the main CSV file
+            csv_files = [f for f in zf.namelist() if f.endswith('.csv') and 'Blocks' in f]
+            if not csv_files:
+                csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+
+            if csv_files:
+                # Use the first (or largest) CSV
+                csv_file = csv_files[0]
+                with zf.open(csv_file) as f:
+                    text = f.read().decode('utf-8', errors='replace')
+                    reader = csv.reader(StringIO(text))
+                    headers = next(reader, None)
+                    if headers:
+                        writer = csv.writer(output)
+                        writer.writerow(headers)
+                        for row in reader:
+                            writer.writerow(row)
+                            count += 1
+    except Exception as e:
+        return None, 0, f"ZIP extraction error: {str(e)}"
+
+    return output.getvalue(), count, None
+
+def generate_csv_preview(csv_content, max_rows=100):
+    """
+    Generate a preview of CSV content for display in the UI.
+
+    Args:
+        csv_content: CSV content as a string
+        max_rows: Maximum number of data rows to include (default 100)
+
+    Returns:
+        dict with 'headers', 'rows', and 'total_count'
+    """
+    try:
+        lines = csv_content.strip().split('\n')
+        if not lines:
+            return {'headers': [], 'rows': [], 'total_count': 0}
+
+        reader = csv.reader(io.StringIO(csv_content))
+        headers = next(reader, [])
+
+        rows = []
+        total_count = 0
+        for row in reader:
+            total_count += 1
+            if len(rows) < max_rows:
+                rows.append(row)
+
+        return {
+            'headers': headers,
+            'rows': rows,
+            'total_count': total_count
+        }
+    except Exception as e:
+        debug_log(f"[MARKETPLACE] CSV preview generation error: {str(e)}")
+        return {'headers': [], 'rows': [], 'total_count': 0, 'error': str(e)}
+
+# =============================================================================
+# MARKETPLACE - Sync Execution
+# =============================================================================
+
+def execute_feed_sync(feed_id, manual=False):
+    """
+    Execute a feed sync operation.
+
+    Args:
+        feed_id: The feed ID from the database
+        manual: Whether this is a manual sync (vs scheduled)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Get feed configuration
+        cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+        feed = feed_row_to_dict(cursor.fetchone())
+
+        if not feed:
+            debug_log(f"[MARKETPLACE] Feed {feed_id} not found")
+            return False, "Feed not found", None
+
+        if not feed['enabled'] and not manual:
+            debug_log(f"[MARKETPLACE] Feed {feed_id} is disabled, skipping")
+            return False, "Feed is disabled", None
+
+        provider_id = feed['provider_id']
+        auth_config = json.loads(feed['auth_config']) if feed['auth_config'] else None
+
+        debug_log(f"[MARKETPLACE] Syncing feed {feed_id}: {feed['name']} ({provider_id})")
+
+        # Download feed content
+        content, error = download_feed_content(provider_id, auth_config)
+        if error:
+            update_feed_status(feed_id, 'error', f"Download failed: {error}")
+            return False, error, None
+
+        # Calculate content hash to detect changes
+        content_hash = hashlib.md5(content).hexdigest()
+
+        # Check if content has changed
+        if feed['content_hash'] == content_hash and not manual:
+            update_feed_status(feed_id, 'unchanged', "Content unchanged since last sync")
+            debug_log(f"[MARKETPLACE] Feed {feed_id} content unchanged")
+            return True, "Content unchanged", None
+
+        # Parse to CSV
+        csv_content, record_count, parse_error = parse_feed_to_csv(provider_id, content)
+        if parse_error:
+            update_feed_status(feed_id, 'error', f"Parse failed: {parse_error}")
+            return False, parse_error, None
+
+        # Generate preview data (first 100 rows as JSON)
+        preview_data = generate_csv_preview(csv_content, max_rows=100)
+        preview_json = json.dumps(preview_data)
+
+        # Store in sync history
+        cursor.execute('''
+            INSERT INTO sync_history (feed_id, status, message, records_count, content_hash, preview_data)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (feed_id, 'success', f"Downloaded {record_count} records", record_count, content_hash, preview_json))
+
+        # Update feed status
+        cursor.execute('''
+            UPDATE feeds SET
+                last_sync = CURRENT_TIMESTAMP,
+                last_sync_status = 'success',
+                last_sync_message = ?,
+                content_hash = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (f"Downloaded {record_count} records", content_hash, feed_id))
+
+        conn.commit()
+
+        # Track transfer result for response
+        transfer_result = None
+        transfer_message = None
+
+        # If authenticated with Cribl, transfer the lookup to target worker groups
+        if app_config['authenticated'] and feed['target_worker_groups']:
+            # Handle target_worker_groups as either JSON array or plain string
+            target_groups_raw = feed['target_worker_groups']
+            try:
+                target_groups = json.loads(target_groups_raw) if target_groups_raw else []
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as plain string (single group name)
+                target_groups = [target_groups_raw] if target_groups_raw else []
+
+            # Filter out empty values only (don't filter 'default' as it's a valid Cribl group name)
+            target_groups = [g for g in target_groups if g]
+
+            if target_groups:
+                debug_log(f"[MARKETPLACE] Transferring lookup to groups: {target_groups}")
+                transfer_result = transfer_feed_to_cribl(
+                    feed,
+                    csv_content,
+                    target_groups,
+                    auto_deploy=feed['auto_deploy']
+                )
+                if transfer_result['success']:
+                    successful = [t['group'] for t in transfer_result['transfers'] if t.get('status') == 'success']
+                    if successful:
+                        transfer_message = f"Transferred to: {', '.join(successful)}"
+                        if feed['auto_deploy']:
+                            transfer_message += " (deployed)"
+                        debug_log(f"[MARKETPLACE] {transfer_message}")
+                else:
+                    transfer_message = f"Transfer failed: {transfer_result['error']}"
+                    debug_log(f"[MARKETPLACE] {transfer_message}")
+            else:
+                transfer_message = "No target worker groups configured (edit feed to set destination)"
+                debug_log(f"[MARKETPLACE] {transfer_message}")
+        elif not app_config['authenticated']:
+            transfer_message = "Not authenticated with Cribl - login to enable transfer"
+            debug_log(f"[MARKETPLACE] {transfer_message}")
+        else:
+            transfer_message = "No target worker groups configured"
+            debug_log(f"[MARKETPLACE] {transfer_message}")
+
+        # Build final message with transfer status
+        final_message = f"Synced {record_count} records"
+        if transfer_message:
+            final_message += f". {transfer_message}"
+
+        debug_log(f"[MARKETPLACE] Feed {feed_id} sync complete: {final_message}")
+        return True, final_message, preview_data
+
+    except Exception as e:
+        debug_log(f"[MARKETPLACE] Feed {feed_id} sync error: {str(e)}")
+        update_feed_status(feed_id, 'error', str(e))
+        return False, str(e), None
+    finally:
+        conn.close()
+
+def update_feed_status(feed_id, status, message):
+    """Update feed sync status in database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE feeds SET
+            last_sync = CURRENT_TIMESTAMP,
+            last_sync_status = ?,
+            last_sync_message = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (status, message, feed_id))
+    conn.commit()
+    conn.close()
+
+def transfer_feed_to_cribl(feed, csv_content, target_groups, auto_deploy=False):
+    """
+    Transfer feed lookup to Cribl worker groups.
+    Uses the same API pattern as the working transfer_lookup function.
+
+    Args:
+        feed: Feed configuration dict
+        csv_content: CSV content string
+        target_groups: List of worker group names
+        auto_deploy: Whether to auto-deploy after transfer
+    """
+    results = {'success': True, 'transfers': [], 'error': None}
+
+    api_type = feed.get('target_api_type', 'stream')
+    filename = feed['lookup_filename']
+    token = app_config['token']
+
+    for group in target_groups:
+        try:
+            debug_log(f"[MARKETPLACE] Transferring {filename} to {group} ({api_type})")
+
+            # Step 1: Upload CSV to temp file
+            upload_url = build_api_url(api_type, group, path='/system/lookups', query=f'filename={filename}')
+            debug_log(f"[MARKETPLACE] Upload URL: {upload_url}")
+
+            upload_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "text/csv"
+            }
+
+            response = requests.put(
+                upload_url,
+                headers=upload_headers,
+                data=csv_content.encode('utf-8'),
+                timeout=60
+            )
+
+            if response.status_code not in [200, 201]:
+                debug_log(f"[MARKETPLACE] Upload failed: {response.status_code} - {response.text}")
+                results['transfers'].append({'group': group, 'status': 'error', 'code': response.status_code})
+                results['success'] = False
+                results['error'] = f"Upload failed: {response.status_code}"
+                continue
+
+            temp_file_response = response.json()
+            temp_file_name = temp_file_response.get('filename')
+            debug_log(f"[MARKETPLACE] Uploaded to temp file: {temp_file_name}")
+
+            # Step 2: Create/update lookup definition
+            lookup_url = build_api_url(api_type, group, path='/system/lookups')
+            lookup_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "id": filename,
+                "fileInfo": {"filename": temp_file_name}
+            }
+
+            # Try POST first (create new)
+            lookup_response = requests.post(lookup_url, headers=lookup_headers, json=payload, timeout=30)
+
+            if lookup_response.status_code == 409 or (lookup_response.status_code == 500 and 'already exists' in lookup_response.text.lower()):
+                # Lookup exists, update it with PATCH
+                debug_log(f"[MARKETPLACE] Lookup exists, updating...")
+                patch_url = f"{lookup_url}/{filename}"
+                lookup_response = requests.patch(patch_url, headers=lookup_headers, json=payload, timeout=30)
+
+            if lookup_response.status_code not in [200, 201]:
+                debug_log(f"[MARKETPLACE] Lookup create/update failed: {lookup_response.status_code} - {lookup_response.text}")
+                results['transfers'].append({'group': group, 'status': 'error', 'code': lookup_response.status_code})
+                results['success'] = False
+                results['error'] = f"Lookup definition failed: {lookup_response.status_code}"
+                continue
+
+            debug_log(f"[MARKETPLACE] Lookup definition created/updated")
+
+            # Step 3: Commit changes
+            commit_url = build_api_url(api_type, group, path='/version/commit')
+            commit_response = requests.post(
+                commit_url,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"message": f"[Marketplace] Updated {filename} from {feed['name']}"},
+                timeout=30
+            )
+
+            if commit_response.status_code == 200:
+                debug_log(f"[MARKETPLACE] Committed changes to {group}")
+            else:
+                debug_log(f"[MARKETPLACE] Commit warning: {commit_response.status_code}")
+
+            # Step 4: Deploy if auto_deploy is enabled
+            if auto_deploy:
+                deploy_url = build_api_url(api_type, group, path=f'/master/groups/{group}/deploy')
+                deploy_response = requests.patch(
+                    deploy_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30
+                )
+                if deploy_response.status_code == 200:
+                    debug_log(f"[MARKETPLACE] Deployed to {group}")
+                else:
+                    debug_log(f"[MARKETPLACE] Deploy failed: {deploy_response.status_code}")
+
+            results['transfers'].append({'group': group, 'status': 'success'})
+
+        except Exception as e:
+            results['transfers'].append({'group': group, 'status': 'error', 'error': str(e)})
+            results['success'] = False
+            results['error'] = str(e)
+
+    return results
+
+def schedule_feed_job(feed_id, schedule_cron):
+    """
+    Schedule a feed sync job using a cron expression.
+
+    Args:
+        feed_id: Feed ID from database
+        schedule_cron: Cron expression (minute hour day_of_month month day_of_week)
+                       e.g., "0 6 * * *" = daily at 6:00 AM
+                       e.g., "0 6 * * 1,3,5" = Mon/Wed/Fri at 6:00 AM
+    """
+    job_id = f"feed_{feed_id}"
+
+    # Remove existing job if any
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    # Parse cron expression (minute hour day_of_month month day_of_week)
+    try:
+        parts = schedule_cron.split()
+        if len(parts) >= 5:
+            minute = parts[0]
+            hour = parts[1]
+            day = parts[2]
+            month = parts[3]
+            day_of_week = parts[4]
+        else:
+            # Default to daily at 6:00 AM if invalid
+            minute, hour, day, month, day_of_week = '0', '6', '*', '*', '*'
+    except (ValueError, AttributeError):
+        minute, hour, day, month, day_of_week = '0', '6', '*', '*', '*'
+
+    scheduler.add_job(
+        execute_feed_sync,
+        CronTrigger(minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week),
+        id=job_id,
+        args=[feed_id],
+        replace_existing=True
+    )
+
+    debug_log(f"[MARKETPLACE] Scheduled job for feed {feed_id}: cron={schedule_cron}")
+
+def load_scheduled_jobs():
+    """Load and schedule all enabled feeds from database."""
+    if not MARKETPLACE_DB_PATH.exists():
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, schedule_cron FROM feeds WHERE enabled = 1')
+    feeds = cursor.fetchall()
+    conn.close()
+
+    for feed in feeds:
+        schedule_feed_job(feed['id'], feed['schedule_cron'] or '0 6 * * *')
+
+    debug_log(f"[MARKETPLACE] Loaded {len(feeds)} scheduled feeds")
 
 # SECURITY: Add security headers to all responses
 @app.after_request
@@ -2668,7 +4374,7 @@ def transfer_lookup():
             
             commit_url = build_api_url(target_api_type, target_group, path='/version/commit')
             commit_payload = {
-                "message": f"Transfer lookup: {target_filename}",
+                "message": f"{COMMIT_PREFIX} Transfer lookup: {target_filename}",
                 "group": target_group,
                 "files": [lookup_csv_path, lookup_yml_path]
             }
@@ -2739,7 +4445,10 @@ def transfer_lookup():
             'success': True,
             'message': success_message,
             'committed': True,
-            'requiresDeploy': True
+            'requiresDeploy': True,
+            'commit_id': commit_id if 'commit_id' in locals() else None,
+            'target_group': target_group,
+            'target_api_type': target_api_type
         })
         
     except requests.exceptions.HTTPError as e:
@@ -2788,7 +4497,12 @@ def commit_changes():
     data = request.json
     worker_group = data.get('worker_group')
     api_type = data.get('api_type', 'stream')
-    commit_message = data.get('commit_message', 'Update lookup files')
+    raw_commit_message = data.get('commit_message', 'Update lookup files')
+    # Add prefix if not already present
+    if raw_commit_message.startswith(COMMIT_PREFIX):
+        commit_message = raw_commit_message
+    else:
+        commit_message = f"{COMMIT_PREFIX} {raw_commit_message}"
     
     if not worker_group:
         return jsonify({'error': 'Worker group required'}), 400
@@ -3136,7 +4850,7 @@ def delete_lookup(worker_group, lookup_filename):
             
             # Attempt partial commit with deletion files
             debug_log(f"   [STEP 3] Attempting partial commit of deletion files only...")
-            commit_message = f"Deleted lookup: {lookup_filename}"
+            commit_message = f"{COMMIT_PREFIX} Deleted lookup: {lookup_filename}"
             commit_url = build_api_url(api_type, worker_group, path='/version/commit')
             
             commit_data = {
@@ -3315,6 +5029,114 @@ def get_pending_changes():
         return jsonify({'success': True, 'pending_count': 0, 'error': str(e)})
 
 
+@app.route('/api/verify-km-commit', methods=['GET'])
+def verify_km_commit():
+    """
+    Verify if a Knowledge Manager commit is still valid/pending.
+
+    Compares a stored commit ID against the current committed version.
+    Returns whether the commit is still the latest (pending deploy) or
+    has been superseded (should clear localStorage).
+
+    Query params:
+      - worker_group: The worker group to check
+      - api_type: stream, edge, or search
+      - commit_id: The stored commit ID to verify
+
+    Returns:
+      - still_valid: True if commit ID matches current committed version
+      - should_clear: True if the commit ID differs (superseded by newer commit)
+      - current_version: The current committed version
+    """
+    if not app_config['authenticated']:
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    worker_group = request.args.get('worker_group')
+    api_type = request.args.get('api_type', 'stream')
+    commit_id = request.args.get('commit_id')
+
+    if not worker_group:
+        return jsonify({'error': 'Worker group required'}), 400
+
+    token = app_config['token']
+
+    debug_log(f"\n[VERIFY-KM] Verifying KM commit for {worker_group} ({api_type})")
+    debug_log(f"   [INFO] Stored commit ID: {commit_id}")
+
+    try:
+        # Get current committed version from /version/committed endpoint
+        committed_url = build_api_url(api_type, worker_group, path='/version/committed')
+        headers = {"Authorization": f"Bearer {token}"}
+
+        debug_log(f"   [INFO] Querying: {committed_url}")
+
+        response = requests.get(committed_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        committed_data = response.json()
+
+        debug_log(f"   [DATA] Committed version response: {json.dumps(committed_data, indent=2)[:500]}")
+
+        # Extract the current committed version
+        current_version = None
+        if 'commit' in committed_data:
+            current_version = committed_data['commit']
+        elif 'version' in committed_data:
+            current_version = committed_data['version']
+        elif 'items' in committed_data and len(committed_data.get('items', [])) > 0:
+            current_version = committed_data['items'][0].get('commit') or committed_data['items'][0].get('version')
+
+        debug_log(f"   [INFO] Current committed version: {current_version}")
+
+        # If no commit_id was provided, can't verify - assume still valid
+        if not commit_id:
+            debug_log(f"   [INFO] No commit ID provided, cannot verify")
+            return jsonify({
+                'success': True,
+                'still_valid': True,
+                'should_clear': False,
+                'reason': 'No commit ID provided for verification',
+                'current_version': current_version
+            })
+
+        # Compare stored commit ID with current version
+        # If they match, our commit is still the latest (pending deploy)
+        # If they differ, a newer commit was made (clear localStorage)
+        still_valid = (commit_id == current_version)
+
+        if still_valid:
+            debug_log(f"   [OK] Commit ID matches current version - still pending deploy")
+        else:
+            debug_log(f"   [INFO] Commit ID differs - newer commit exists, should clear localStorage")
+
+        return jsonify({
+            'success': True,
+            'still_valid': still_valid,
+            'should_clear': not still_valid,
+            'stored_commit': commit_id,
+            'current_version': current_version,
+            'reason': 'Commit matches current version' if still_valid else 'Newer commit exists'
+        })
+
+    except requests.exceptions.HTTPError as e:
+        debug_log(f"   [WARNING] Could not get committed version: {e.response.status_code}")
+        # If we can't verify, assume still valid to be safe
+        return jsonify({
+            'success': True,
+            'still_valid': True,
+            'should_clear': False,
+            'reason': f'Could not verify: HTTP {e.response.status_code}'
+        })
+
+    except Exception as e:
+        debug_log(f"   [ERROR] Error: {str(e)}")
+        return jsonify({
+            'success': True,
+            'still_valid': True,
+            'should_clear': False,
+            'reason': f'Could not verify: {str(e)}'
+        })
+
+
 @app.route('/api/current-version', methods=['GET'])
 def get_current_version():
     """
@@ -3419,6 +5241,295 @@ def get_current_version():
 
 
 # =============================================================================
+# MARKETPLACE API ENDPOINTS
+# =============================================================================
+
+@app.route('/api/marketplace/providers', methods=['GET'])
+def get_feed_providers():
+    """Get list of available feed providers."""
+    providers = []
+    for provider_id, config in FEED_PROVIDERS.items():
+        providers.append({
+            'id': provider_id,
+            'name': config['name'],
+            'description': config['description'],
+            'category': config['category'],
+            'auth_type': config['auth_type'],
+            'default_filename': config['default_filename'],
+            'update_frequency': config['update_frequency'],
+            'note': config.get('note')
+        })
+    return jsonify({'providers': providers})
+
+@app.route('/api/marketplace/feeds', methods=['GET'])
+def get_feeds():
+    """Get all configured feeds."""
+    init_marketplace_db()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM feeds ORDER BY created_at DESC')
+    feeds = [feed_row_to_dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jsonify({'feeds': feeds})
+
+@app.route('/api/marketplace/feeds', methods=['POST'])
+def create_feed():
+    """Create a new feed configuration."""
+    init_marketplace_db()
+    data = request.json
+
+    provider_id = data.get('provider_id')
+    if provider_id not in FEED_PROVIDERS:
+        return jsonify({'error': f'Unknown provider: {provider_id}'}), 400
+
+    provider = FEED_PROVIDERS[provider_id]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute('''
+            INSERT INTO feeds (
+                provider_id, name, enabled, lookup_filename,
+                schedule_cron, target_api_type,
+                target_worker_groups, auto_deploy, auth_config
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            provider_id,
+            data.get('name', provider['name']),
+            1 if data.get('enabled', True) else 0,
+            data.get('lookup_filename', provider['default_filename']),
+            data.get('schedule_cron', '0 6 * * *'),
+            data.get('target_api_type', 'stream'),
+            data.get('target_worker_group', 'default'),
+            1 if data.get('auto_deploy', False) else 0,
+            json.dumps(data.get('auth_config', {}))
+        ))
+
+        feed_id = cursor.lastrowid
+        conn.commit()
+
+        # Schedule the job if enabled
+        if data.get('enabled', True):
+            schedule_feed_job(feed_id, data.get('schedule_cron', '0 6 * * *'))
+
+        # Fetch the created feed
+        cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+        feed = feed_row_to_dict(cursor.fetchone())
+        conn.close()
+
+        return jsonify({'success': True, 'feed': feed}), 201
+
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/marketplace/feeds/<int:feed_id>', methods=['GET'])
+def get_feed(feed_id):
+    """Get a specific feed configuration."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+    feed = feed_row_to_dict(cursor.fetchone())
+    conn.close()
+
+    if not feed:
+        return jsonify({'error': 'Feed not found'}), 404
+
+    return jsonify(feed)
+
+@app.route('/api/marketplace/feeds/<int:feed_id>', methods=['PUT'])
+def update_feed(feed_id):
+    """Update a feed configuration."""
+    data = request.json
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check if feed exists
+    cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({'error': 'Feed not found'}), 404
+
+    try:
+        cursor.execute('''
+            UPDATE feeds SET
+                name = ?,
+                enabled = ?,
+                lookup_filename = ?,
+                schedule_cron = ?,
+                target_api_type = ?,
+                target_worker_groups = ?,
+                auto_deploy = ?,
+                auth_config = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (
+            data.get('name', existing['name']),
+            1 if data.get('enabled', existing['enabled']) else 0,
+            data.get('lookup_filename', existing['lookup_filename']),
+            data.get('schedule_cron', existing['schedule_cron'] or '0 6 * * *'),
+            data.get('target_api_type', existing['target_api_type']),
+            data.get('target_worker_groups', existing['target_worker_groups'] or 'default'),
+            1 if data.get('auto_deploy', existing['auto_deploy']) else 0,
+            json.dumps(data.get('auth_config', json.loads(existing['auth_config'] or '{}'))),
+            feed_id
+        ))
+
+        conn.commit()
+
+        # Update scheduled job
+        if data.get('enabled', existing['enabled']):
+            schedule_feed_job(feed_id, data.get('schedule_cron', existing['schedule_cron'] or '0 6 * * *'))
+        else:
+            # Remove job if disabled
+            job_id = f"feed_{feed_id}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+
+        # Fetch updated feed
+        cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+        feed = feed_row_to_dict(cursor.fetchone())
+        conn.close()
+
+        return jsonify({'success': True, 'feed': feed})
+
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/marketplace/feeds/<int:feed_id>', methods=['DELETE'])
+def delete_feed(feed_id):
+    """Delete a feed configuration."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check if feed exists
+    cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'error': 'Feed not found'}), 404
+
+    # Remove scheduled job
+    job_id = f"feed_{feed_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    # Delete feed and history
+    cursor.execute('DELETE FROM sync_history WHERE feed_id = ?', (feed_id,))
+    cursor.execute('DELETE FROM feeds WHERE id = ?', (feed_id,))
+    conn.commit()
+    conn.close()
+
+    return jsonify({'success': True})
+
+@app.route('/api/marketplace/feeds/<int:feed_id>/sync', methods=['POST'])
+def sync_feed(feed_id):
+    """Manually trigger a feed sync."""
+    success, message, preview_data = execute_feed_sync(feed_id, manual=True)
+    if success:
+        response = {'success': True, 'message': message}
+        if preview_data:
+            response['preview'] = preview_data
+        return jsonify(response)
+    else:
+        return jsonify({'success': False, 'error': message}), 500
+
+@app.route('/api/marketplace/feeds/<int:feed_id>/history', methods=['GET'])
+def get_feed_history(feed_id):
+    """Get sync history for a feed."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM sync_history
+        WHERE feed_id = ?
+        ORDER BY sync_time DESC
+        LIMIT 50
+    ''', (feed_id,))
+    history = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jsonify(history)
+
+@app.route('/api/marketplace/feeds/<int:feed_id>/preview', methods=['GET'])
+def preview_feed(feed_id):
+    """Preview feed content without saving (download and parse only)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM feeds WHERE id = ?', (feed_id,))
+    feed = feed_row_to_dict(cursor.fetchone())
+    conn.close()
+
+    if not feed:
+        return jsonify({'error': 'Feed not found'}), 404
+
+    provider_id = feed['provider_id']
+    auth_config = json.loads(feed['auth_config']) if feed['auth_config'] else None
+
+    # Download and parse
+    content, error = download_feed_content(provider_id, auth_config)
+    if error:
+        return jsonify({'success': False, 'error': f"Download failed: {error}"}), 500
+
+    csv_content, record_count, parse_error = parse_feed_to_csv(provider_id, content)
+    if parse_error:
+        return jsonify({'success': False, 'error': f"Parse failed: {parse_error}"}), 500
+
+    # Return preview (first 100 lines)
+    lines = csv_content.split('\n')[:101]
+    preview = '\n'.join(lines)
+
+    return jsonify({
+        'success': True,
+        'record_count': record_count,
+        'preview': preview,
+        'preview_lines': min(100, record_count + 1)
+    })
+
+@app.route('/api/marketplace/test-provider', methods=['POST'])
+def test_provider():
+    """Test a feed provider with given auth config."""
+    data = request.json
+    provider_id = data.get('provider_id')
+    auth_config = data.get('auth_config', {})
+
+    if provider_id not in FEED_PROVIDERS:
+        return jsonify({'error': f'Unknown provider: {provider_id}'}), 400
+
+    # Try to download
+    content, error = download_feed_content(provider_id, auth_config)
+    if error:
+        return jsonify({'success': False, 'error': error})
+
+    # Try to parse
+    csv_content, record_count, parse_error = parse_feed_to_csv(provider_id, content)
+    if parse_error:
+        return jsonify({'success': False, 'error': parse_error})
+
+    return jsonify({
+        'success': True,
+        'message': f'Successfully downloaded and parsed {record_count} records'
+    })
+
+@app.route('/api/marketplace/scheduler/status', methods=['GET'])
+def get_scheduler_status():
+    """Get scheduler status and scheduled jobs."""
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            'id': job.id,
+            'next_run_time': str(job.next_run_time) if job.next_run_time else None,
+            'trigger': str(job.trigger)
+        })
+
+    return jsonify({
+        'running': scheduler.running,
+        'jobs': jobs
+    })
+
+
+# =============================================================================
 # SERVER STARTUP UTILITIES
 # =============================================================================
 
@@ -3479,7 +5590,7 @@ def get_available_port(preferred_port=42002):
 if __name__ == '__main__':
     # Display startup banner
     print("\n" + "="*60)
-    print("[SERVER] Cribl Knowledge Manager v0.1.0")
+    print("[SERVER] Cribl Knowledge Manager v4.0.0")
     print("="*60)
     
     # Check for credentials (environment variables or config file)
@@ -3496,7 +5607,15 @@ if __name__ == '__main__':
         print("   Option 1: Set environment variables (more secure):")
         print("             CRIBL_CLIENT_ID, CRIBL_CLIENT_SECRET, CRIBL_ORG_ID")
         print("   Option 2: Create config.ini from config.ini.template")
-    
+
+    # Initialize Marketplace database and scheduler
+    print("\n[MARKETPLACE] Initializing feed scheduler...")
+    init_marketplace_db()
+    scheduler.start()
+    load_scheduled_jobs()
+    atexit.register(lambda: scheduler.shutdown())
+    print("[OK] Marketplace scheduler started")
+
     # Get available port
     default_port = 42002
     print("\n[PORT] Checking port availability...")
